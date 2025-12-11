@@ -406,7 +406,8 @@ def main():
         if entry_id in seen_ids:
             logging.info("Already processed entry: %s", entry_id)
             continue
-        if not event_within_next_five_days(e):
+        if not entry_time_within_lookback(e, LOOKBACK_HOURS):
+            logging.info("Entry outside lookback window: %s", entry_id)
             continue
         if not looks_like_roundup_case(e):
             logging.info("Entry did not match roundup filters: %s", entry_id)
