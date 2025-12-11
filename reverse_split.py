@@ -25,7 +25,7 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 # Sender (Gmail with App Password)
-SENDER_EMAIL = os.environ.get("ALERT_SENDER_EMAIL")
+SENDER_EMAIL = os.environ.get("ALERT_SENDER_EMAIL", "werdnamdlog01@gmail.com")
 SENDER_APP_PASSWORD = os.environ.get("ALERT_SENDER_APP_PWD")
 
 # Recipients
@@ -33,9 +33,6 @@ RECIPIENTS = [
     "dag5wd@virginia.edu",
     "lcordover14@gmail.com",
 ]
-
-# How far back to look each run
-LOOKBACK_HOURS = 4
 
 # Track already-alerted links
 STATE_FILE = Path("reverse_split_seen.json")
@@ -89,16 +86,93 @@ def entry_label(entry) -> str:
     return title
 
 # ==========================
-# TIME FILTER
+# DATE PARSING (EFFECTIVE WITHIN 5 DAYS)
 # ==========================
 
-def entry_time_within_lookback(entry, lookback_hours):
-    if not hasattr(entry, "published_parsed") or entry.published_parsed is None:
-        # If no timestamp, keep (we prefer false positives)
-        return True
-    pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    return pub_dt >= cutoff
+MONTH_MAP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+MONTH_DAY_PATTERN = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{2,4}))?",
+    re.IGNORECASE,
+)
+
+NUMERIC_DATE_PATTERN = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
+
+
+def _normalize_year(year_text: str | None, today_year: int) -> int:
+    if not year_text:
+        return today_year
+    try:
+        year = int(year_text)
+        if year < 100:
+            return 2000 + year
+        return year
+    except ValueError:
+        return today_year
+
+
+def _iter_candidate_dates(text: str):
+    """Yield date objects parsed from common month/day/year patterns."""
+
+    today_year = datetime.now(timezone.utc).year
+
+    for m in MONTH_DAY_PATTERN.finditer(text):
+        month_key = m.group(1).lower()[:3]
+        month = MONTH_MAP.get(month_key)
+        day = int(m.group(2))
+        year = _normalize_year(m.group(3), today_year)
+        if month:
+            yield datetime(year, month, day, tzinfo=timezone.utc).date()
+
+    for m in NUMERIC_DATE_PATTERN.finditer(text):
+        month = int(m.group(1))
+        day = int(m.group(2))
+        year = _normalize_year(m.group(3), today_year)
+        try:
+            yield datetime(year, month, day, tzinfo=timezone.utc).date()
+        except ValueError:
+            continue
+
+    lowered = text.lower()
+    today = datetime.now(timezone.utc).date()
+    if "tomorrow" in lowered:
+        yield today + timedelta(days=1)
+    if "today" in lowered:
+        yield today
+
+
+def event_within_next_five_days(entry):
+    """Return True if we can infer the split happens within the next 5 days."""
+
+    window_start = datetime.now(timezone.utc).date()
+    window_end = window_start + timedelta(days=5)
+    text = f"{entry.title} {getattr(entry, 'summary', '')}"
+
+    for candidate in _iter_candidate_dates(text):
+        if window_start <= candidate <= window_end:
+            logging.info("Split date %s within window for entry: %s", candidate, entry_label(entry))
+            return True
+        if candidate < window_start:
+            logging.info("Filtered past-dated split (%s) for entry: %s", candidate, entry_label(entry))
+        else:
+            logging.info("Filtered split outside 5-day window (%s) for entry: %s", candidate, entry_label(entry))
+
+    logging.info("No effective date within 5 days found for entry: %s", entry_label(entry))
+    return False
 
 # ==========================
 # RATIO / TICKER / PRICE HELPERS
@@ -296,8 +370,10 @@ def format_email(new_items):
     return "\n".join(lines)
 
 def send_email(subject, body):
-    if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
-        raise RuntimeError("Set ALERT_SENDER_EMAIL and ALERT_SENDER_APP_PWD environment variables first.")
+    if not SENDER_APP_PASSWORD:
+        raise RuntimeError(
+            "Set ALERT_SENDER_APP_PWD with the Gmail app password for the sender account."
+        )
 
     msg = MIMEText(body)
     msg["Subject"] = subject
