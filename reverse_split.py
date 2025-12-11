@@ -37,6 +37,9 @@ RECIPIENTS = [
 # Track already-alerted links
 STATE_FILE = Path("reverse_split_seen.json")
 
+# Human-readable record of alerts that passed all filters in the latest run
+RESULTS_FILE = Path("reverse_split_results.json")
+
 # Wide, false-positive-biased Google News queries
 SEARCH_QUERIES = [
     '"reverse stock split" "rounded up to the nearest whole share"',
@@ -63,6 +66,16 @@ def load_seen_ids():
 
 def save_seen_ids(seen_ids):
     STATE_FILE.write_text(json.dumps(sorted(list(seen_ids))))
+
+
+def save_results(items):
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(items),
+        "items": items,
+    }
+    RESULTS_FILE.write_text(json.dumps(payload, indent=2))
+    logging.info("Wrote %s items to %s", len(items), RESULTS_FILE)
 
 # ==========================
 # FETCH FEED ENTRIES
@@ -406,6 +419,8 @@ def main():
         if entry_id in seen_ids:
             logging.info("Already processed entry: %s", entry_id)
             continue
+        if not event_within_next_five_days(e):
+            continue
         if not looks_like_roundup_case(e):
             logging.info("Entry did not match roundup filters: %s", entry_id)
             continue
@@ -422,6 +437,8 @@ def main():
         subject = f"[Reverse Split Alert] {len(new_items)} potential rounding-up events"
         body = format_email(new_items)
         send_email(subject, body)
+
+    save_results(new_items)
 
     save_seen_ids(seen_ids)
 
