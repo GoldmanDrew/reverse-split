@@ -24,6 +24,5 @@ jobs:
 
       - name: Run reverse split scanner
         env:
-          ALERT_SENDER_EMAIL: ${{ secrets.ALERT_SENDER_EMAIL }}
           ALERT_SENDER_APP_PWD: ${{ secrets.ALERT_SENDER_APP_PWD }}
         run: python reverse_split.py

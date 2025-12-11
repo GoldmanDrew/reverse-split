@@ -10,7 +10,9 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import feedparser
+import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 # ==========================
 # CONFIG / LOGGING
@@ -168,23 +170,77 @@ def _iter_candidate_dates(text: str):
         yield today
 
 
+def _fetch_article_text(url: str) -> str:
+    """Download the article body for deeper date parsing.
+
+    We only fetch when feed text lacks an actionable date. Failures keep the
+    entry excluded but are logged so we can understand misses.
+    """
+
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    chunks = []
+    for tag in soup.find_all(["h1", "h2", "p", "li"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if text:
+            chunks.append(text)
+
+    return " ".join(chunks)
+
+
+def _candidate_date_sources(entry):
+    """Build an ordered list of (source_label, text) to scan for dates."""
+
+    primary_text = f"{entry.title} {getattr(entry, 'summary', '')}".strip()
+    yield "feed", primary_text
+
+    link = getattr(entry, "link", None)
+    if link:
+        try:
+            article_text = _fetch_article_text(link)
+            if article_text:
+                yield "article", article_text
+        except Exception as exc:  # noqa: BLE001
+            logging.info("Could not fetch article body (%s) for %s", exc, entry_label(entry))
+
+
 def event_within_next_five_days(entry):
     """Return True if we can infer the split happens within the next 5 days."""
 
     window_start = datetime.now(timezone.utc).date()
     window_end = window_start + timedelta(days=5)
-    text = f"{entry.title} {getattr(entry, 'summary', '')}"
 
-    for candidate in _iter_candidate_dates(text):
-        if window_start <= candidate <= window_end:
-            logging.info("Split date %s within window for entry: %s", candidate, entry_label(entry))
-            return True
-        if candidate < window_start:
-            logging.info("Filtered past-dated split (%s) for entry: %s", candidate, entry_label(entry))
-        else:
-            logging.info("Filtered split outside 5-day window (%s) for entry: %s", candidate, entry_label(entry))
+    for source_label, text in _candidate_date_sources(entry):
+        for candidate in _iter_candidate_dates(text):
+            if window_start <= candidate <= window_end:
+                logging.info(
+                    "Split date %s within window for entry (%s source): %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
+                return True
+            if candidate < window_start:
+                logging.info(
+                    "Filtered past-dated split (%s, %s source) for entry: %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
+            else:
+                logging.info(
+                    "Filtered split outside 5-day window (%s, %s source) for entry: %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
 
-    logging.info("No effective date within 5 days found for entry: %s", entry_label(entry))
+    logging.info(
+        "No effective date within 5 days found (checked feed + article) for entry: %s",
+        entry_label(entry),
+    )
     return False
 
 # ==========================
