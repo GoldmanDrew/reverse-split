@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 
+import json
+import logging
 import os
 import re
 import smtplib
-from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
-import json
 
 import feedparser
+import requests
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 # ==========================
-# CONFIG
+# CONFIG / LOGGING
 # ==========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+)
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 # Sender (Gmail with App Password)
-SENDER_EMAIL = os.environ.get("ALERT_SENDER_EMAIL")
+SENDER_EMAIL = os.environ.get("ALERT_SENDER_EMAIL", "werdnamdlog01@gmail.com")
 SENDER_APP_PASSWORD = os.environ.get("ALERT_SENDER_APP_PWD")
 
 # Recipients
@@ -28,11 +36,11 @@ RECIPIENTS = [
     "lcordover14@gmail.com",
 ]
 
-# How far back to look each run
-LOOKBACK_HOURS = 4
-
 # Track already-alerted links
 STATE_FILE = Path("reverse_split_seen.json")
+
+# Human-readable record of alerts that passed all filters in the latest run
+RESULTS_FILE = Path("reverse_split_results.json")
 
 # Wide, false-positive-biased Google News queries
 SEARCH_QUERIES = [
@@ -61,6 +69,16 @@ def load_seen_ids():
 def save_seen_ids(seen_ids):
     STATE_FILE.write_text(json.dumps(sorted(list(seen_ids))))
 
+
+def save_results(items):
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(items),
+        "items": items,
+    }
+    RESULTS_FILE.write_text(json.dumps(payload, indent=2))
+    logging.info("Wrote %s items to %s", len(items), RESULTS_FILE)
+
 # ==========================
 # FETCH FEED ENTRIES
 # ==========================
@@ -74,17 +92,192 @@ def fetch_entries():
         entries.extend(feed.entries)
     return entries
 
+
+def entry_label(entry) -> str:
+    title = getattr(entry, "title", "(no title)")
+    link = getattr(entry, "link", "")
+    if link:
+        return f"{title} [{link}]"
+    return title
+
 # ==========================
-# TIME FILTER
+# DATE PARSING (EFFECTIVE WITHIN 5 DAYS)
 # ==========================
 
-def entry_time_within_lookback(entry, lookback_hours):
-    if not hasattr(entry, "published_parsed") or entry.published_parsed is None:
-        # If no timestamp, keep (we prefer false positives)
-        return True
-    pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    return pub_dt >= cutoff
+MONTH_MAP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+WEEKDAY_MAP = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+MONTH_DAY_PATTERN = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{2,4}))?",
+    re.IGNORECASE,
+)
+
+NUMERIC_DATE_PATTERN = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
+
+WEEKDAY_PATTERN = re.compile(
+    r"\b(?:effective|effect|in effect|will take effect|expected to take effect|scheduled to take effect|will become effective|become effective|be effective|effective as of|on)\s+(?:at\s+(?:the\s+)?(?:open|close)\s+of\s+trading\s+on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_year(year_text: str | None, today_year: int) -> int:
+    if not year_text:
+        return today_year
+    try:
+        year = int(year_text)
+        if year < 100:
+            return 2000 + year
+        return year
+    except ValueError:
+        return today_year
+
+
+def _iter_candidate_dates(text: str):
+    """Yield date objects parsed from common month/day/year patterns."""
+
+    today_year = datetime.now(timezone.utc).year
+    today = datetime.now(timezone.utc).date()
+
+    for m in MONTH_DAY_PATTERN.finditer(text):
+        month_key = m.group(1).lower()[:3]
+        month = MONTH_MAP.get(month_key)
+        day = int(m.group(2))
+        year = _normalize_year(m.group(3), today_year)
+        if month:
+            yield datetime(year, month, day, tzinfo=timezone.utc).date()
+
+    for m in NUMERIC_DATE_PATTERN.finditer(text):
+        month = int(m.group(1))
+        day = int(m.group(2))
+        year = _normalize_year(m.group(3), today_year)
+        try:
+            yield datetime(year, month, day, tzinfo=timezone.utc).date()
+        except ValueError:
+            continue
+
+    lowered = text.lower()
+    if "tomorrow" in lowered:
+        yield today + timedelta(days=1)
+    if "today" in lowered:
+        yield today
+
+    for m in WEEKDAY_PATTERN.finditer(text):
+        weekday_name = m.group(1).lower()
+        target_index = WEEKDAY_MAP.get(weekday_name)
+        if target_index is None:
+            continue
+        days_ahead = (target_index - today.weekday()) % 7
+        candidate_date = today + timedelta(days=days_ahead)
+        yield candidate_date
+
+
+def _fetch_article_text(url: str) -> str:
+    """Download the article body for deeper date parsing.
+
+    We only fetch when feed text lacks an actionable date. Failures keep the
+    entry excluded but are logged so we can understand misses.
+    """
+
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    chunks = []
+    for tag in soup.find_all(["h1", "h2", "p", "li"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if text:
+            chunks.append(text)
+
+    return " ".join(chunks)
+
+
+def _candidate_date_sources(entry):
+    """Build an ordered list of (source_label, text) to scan for dates."""
+
+    primary_text = f"{entry.title} {getattr(entry, 'summary', '')}".strip()
+    yield "feed", primary_text
+
+    link = getattr(entry, "link", None)
+    if link:
+        try:
+            article_text = _fetch_article_text(link)
+            if article_text:
+                yield "article", article_text
+        except Exception as exc:  # noqa: BLE001
+            logging.info("Could not fetch article body (%s) for %s", exc, entry_label(entry))
+
+
+def event_within_next_five_days(entry):
+    """Return True if we can infer the split happens within the next 5 days."""
+
+    window_start = datetime.now(timezone.utc).date()
+    window_end = window_start + timedelta(days=5)
+
+    for source_label, text in _candidate_date_sources(entry):
+        for candidate in _iter_candidate_dates(text):
+            if window_start <= candidate <= window_end:
+                logging.info(
+                    "Split date %s within window for entry (%s source): %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
+                return True
+            if candidate < window_start:
+                logging.info(
+                    "Filtered past-dated split (%s, %s source) for entry: %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
+            else:
+                logging.info(
+                    "Filtered split outside 5-day window (%s, %s source) for entry: %s",
+                    candidate,
+                    source_label,
+                    entry_label(entry),
+                )
+
+    published_parsed = getattr(entry, "published_parsed", None)
+    if published_parsed:
+        published_dt = datetime(*published_parsed[:6], tzinfo=timezone.utc)
+        published_date = published_dt.date()
+        if window_start <= published_date <= window_end:
+            logging.info(
+                "No explicit effective date found but article published within window (%s); keeping entry: %s",
+                published_date,
+                entry_label(entry),
+            )
+            return True
+
+    logging.info(
+        "No effective date within 5 days found (checked feed + article) for entry: %s",
+        entry_label(entry),
+    )
+    return False
 
 # ==========================
 # RATIO / TICKER / PRICE HELPERS
@@ -134,20 +327,34 @@ def passes_price_threshold(text: str, min_post_price: float = 1.0) -> bool:
     symbol = extract_ticker(text)
 
     if not ratio or not symbol:
+        if not ratio:
+            logging.info("Skipping price filter (no ratio found) for text starting: %s", text[:120])
+        if not symbol:
+            logging.info("Skipping price filter (no ticker found) for text starting: %s", text[:120])
         return True  # cannot safely filter, keep it
 
     try:
         tk = yf.Ticker(symbol)
         hist = tk.history(period="1d")
         if hist.empty:
+            logging.info("Price history empty for %s; keeping entry", symbol)
             return True
         price = float(hist["Close"].iloc[-1])
-    except Exception:
+    except Exception as exc:
+        logging.info("Could not fetch price for %s (%s); keeping entry", symbol, exc)
         return True  # network/API/other issues → do not exclude
 
     theoretical_post = price * ratio
 
     if theoretical_post < min_post_price:
+        logging.info(
+            "Filtered %s: ratio %s, last %.2f, theoretical post-split %.2f < threshold %.2f",
+            symbol,
+            ratio,
+            price,
+            theoretical_post,
+            min_post_price,
+        )
         return False
 
     return True
@@ -159,6 +366,7 @@ def passes_price_threshold(text: str, min_post_price: float = 1.0) -> bool:
 def looks_like_roundup_case(entry):
     text_raw = f"{entry.title} {getattr(entry, 'summary', '')}"
     text = text_raw.lower()
+    label = entry_label(entry)
 
     # -----------------------------------------------------------
     # EXCLUSIONS: ADRs, Canadian companies, ETFs
@@ -182,10 +390,13 @@ def looks_like_roundup_case(entry):
     ]
 
     if any(k in text for k in adr_keywords):
+        logging.info("Filtered ADR-related entry: %s", label)
         return False
     if any(k in text for k in canadian_keywords):
+        logging.info("Filtered Canadian listing: %s", label)
         return False
     if any(k in text for k in etf_keywords):
+        logging.info("Filtered ETF/trust language: %s", label)
         return False
 
     # -----------------------------------------------------------
@@ -197,6 +408,7 @@ def looks_like_roundup_case(entry):
         "share consolidation",
         "share combination",
     ]):
+        logging.info("Filtered non-split entry: %s", label)
         return False
 
     # -----------------------------------------------------------
@@ -263,8 +475,10 @@ def format_email(new_items):
     return "\n".join(lines)
 
 def send_email(subject, body):
-    if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
-        raise RuntimeError("Set ALERT_SENDER_EMAIL and ALERT_SENDER_APP_PWD environment variables first.")
+    if not SENDER_APP_PASSWORD:
+        raise RuntimeError(
+            "Set ALERT_SENDER_APP_PWD with the Gmail app password for the sender account."
+        )
 
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -289,15 +503,18 @@ def main():
     for e in entries:
         link = getattr(e, "link", None)
         if not link:
+            logging.info("Skipping entry without link: %s", entry_label(e))
             continue
 
         entry_id = link
 
         if entry_id in seen_ids:
+            logging.info("Already processed entry: %s", entry_id)
             continue
-        if not entry_time_within_lookback(e, LOOKBACK_HOURS):
+        if not event_within_next_five_days(e):
             continue
         if not looks_like_roundup_case(e):
+            logging.info("Entry did not match roundup filters: %s", entry_id)
             continue
 
         new_items.append({
@@ -312,6 +529,8 @@ def main():
         subject = f"[Reverse Split Alert] {len(new_items)} potential rounding-up events"
         body = format_email(new_items)
         send_email(subject, body)
+
+    save_results(new_items)
 
     save_seen_ids(seen_ids)
 
