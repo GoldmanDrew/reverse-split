@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 
+import json
+import logging
 import os
 import re
 import smtplib
-from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
-import json
 
 import feedparser
 import yfinance as yf
 
 # ==========================
-# CONFIG
+# CONFIG / LOGGING
 # ==========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+)
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -73,6 +79,14 @@ def fetch_entries():
         feed = feedparser.parse(rss_url)
         entries.extend(feed.entries)
     return entries
+
+
+def entry_label(entry) -> str:
+    title = getattr(entry, "title", "(no title)")
+    link = getattr(entry, "link", "")
+    if link:
+        return f"{title} [{link}]"
+    return title
 
 # ==========================
 # TIME FILTER
@@ -134,20 +148,34 @@ def passes_price_threshold(text: str, min_post_price: float = 1.0) -> bool:
     symbol = extract_ticker(text)
 
     if not ratio or not symbol:
+        if not ratio:
+            logging.info("Skipping price filter (no ratio found) for text starting: %s", text[:120])
+        if not symbol:
+            logging.info("Skipping price filter (no ticker found) for text starting: %s", text[:120])
         return True  # cannot safely filter, keep it
 
     try:
         tk = yf.Ticker(symbol)
         hist = tk.history(period="1d")
         if hist.empty:
+            logging.info("Price history empty for %s; keeping entry", symbol)
             return True
         price = float(hist["Close"].iloc[-1])
-    except Exception:
+    except Exception as exc:
+        logging.info("Could not fetch price for %s (%s); keeping entry", symbol, exc)
         return True  # network/API/other issues → do not exclude
 
     theoretical_post = price * ratio
 
     if theoretical_post < min_post_price:
+        logging.info(
+            "Filtered %s: ratio %s, last %.2f, theoretical post-split %.2f < threshold %.2f",
+            symbol,
+            ratio,
+            price,
+            theoretical_post,
+            min_post_price,
+        )
         return False
 
     return True
@@ -159,6 +187,7 @@ def passes_price_threshold(text: str, min_post_price: float = 1.0) -> bool:
 def looks_like_roundup_case(entry):
     text_raw = f"{entry.title} {getattr(entry, 'summary', '')}"
     text = text_raw.lower()
+    label = entry_label(entry)
 
     # -----------------------------------------------------------
     # EXCLUSIONS: ADRs, Canadian companies, ETFs
@@ -182,10 +211,13 @@ def looks_like_roundup_case(entry):
     ]
 
     if any(k in text for k in adr_keywords):
+        logging.info("Filtered ADR-related entry: %s", label)
         return False
     if any(k in text for k in canadian_keywords):
+        logging.info("Filtered Canadian listing: %s", label)
         return False
     if any(k in text for k in etf_keywords):
+        logging.info("Filtered ETF/trust language: %s", label)
         return False
 
     # -----------------------------------------------------------
@@ -197,6 +229,7 @@ def looks_like_roundup_case(entry):
         "share consolidation",
         "share combination",
     ]):
+        logging.info("Filtered non-split entry: %s", label)
         return False
 
     # -----------------------------------------------------------
@@ -289,15 +322,19 @@ def main():
     for e in entries:
         link = getattr(e, "link", None)
         if not link:
+            logging.info("Skipping entry without link: %s", entry_label(e))
             continue
 
         entry_id = link
 
         if entry_id in seen_ids:
+            logging.info("Already processed entry: %s", entry_id)
             continue
         if not entry_time_within_lookback(e, LOOKBACK_HOURS):
+            logging.info("Entry outside lookback window: %s", entry_id)
             continue
         if not looks_like_roundup_case(e):
+            logging.info("Entry did not match roundup filters: %s", entry_id)
             continue
 
         new_items.append({
