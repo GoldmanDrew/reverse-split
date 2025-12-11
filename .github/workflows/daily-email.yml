@@ -2,7 +2,7 @@ name: Daily Reverse Split Alerts
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 12 * * *'
   workflow_dispatch:
 
 jobs:
@@ -24,5 +24,6 @@ jobs:
 
       - name: Run reverse split scanner
         env:
+          ALERT_SENDER_EMAIL: ${{ secrets.ALERT_SENDER_EMAIL }}
           ALERT_SENDER_APP_PWD: ${{ secrets.ALERT_SENDER_APP_PWD }}
         run: python reverse_split.py
