@@ -120,12 +120,27 @@ MONTH_MAP = {
     "dec": 12,
 }
 
+WEEKDAY_MAP = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
 MONTH_DAY_PATTERN = re.compile(
     r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{2,4}))?",
     re.IGNORECASE,
 )
 
 NUMERIC_DATE_PATTERN = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
+
+WEEKDAY_PATTERN = re.compile(
+    r"\b(?:effective|effect|in effect|will take effect|expected to take effect|scheduled to take effect|will become effective|become effective|be effective|effective as of|on)\s+(?:at\s+(?:the\s+)?(?:open|close)\s+of\s+trading\s+on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_year(year_text: str | None, today_year: int) -> int:
@@ -144,6 +159,7 @@ def _iter_candidate_dates(text: str):
     """Yield date objects parsed from common month/day/year patterns."""
 
     today_year = datetime.now(timezone.utc).year
+    today = datetime.now(timezone.utc).date()
 
     for m in MONTH_DAY_PATTERN.finditer(text):
         month_key = m.group(1).lower()[:3]
@@ -163,11 +179,19 @@ def _iter_candidate_dates(text: str):
             continue
 
     lowered = text.lower()
-    today = datetime.now(timezone.utc).date()
     if "tomorrow" in lowered:
         yield today + timedelta(days=1)
     if "today" in lowered:
         yield today
+
+    for m in WEEKDAY_PATTERN.finditer(text):
+        weekday_name = m.group(1).lower()
+        target_index = WEEKDAY_MAP.get(weekday_name)
+        if target_index is None:
+            continue
+        days_ahead = (target_index - today.weekday()) % 7
+        candidate_date = today + timedelta(days=days_ahead)
+        yield candidate_date
 
 
 def _fetch_article_text(url: str) -> str:
@@ -236,6 +260,18 @@ def event_within_next_five_days(entry):
                     source_label,
                     entry_label(entry),
                 )
+
+    published_parsed = getattr(entry, "published_parsed", None)
+    if published_parsed:
+        published_dt = datetime(*published_parsed[:6], tzinfo=timezone.utc)
+        published_date = published_dt.date()
+        if window_start <= published_date <= window_end:
+            logging.info(
+                "No explicit effective date found but article published within window (%s); keeping entry: %s",
+                published_date,
+                entry_label(entry),
+            )
+            return True
 
     logging.info(
         "No effective date within 5 days found (checked feed + article) for entry: %s",

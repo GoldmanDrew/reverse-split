@@ -1,6 +1,12 @@
 # reverse-split
 
-A small helper script that scans Google News for reverse split announcements and flags situations where fractional shares might be rounded up to whole shares ("free round up" scenarios). It searches broadly, filters out clear false positives, applies price/ratio sanity checks, looks for effective dates occurring within the next five days (including by scraping the linked article when the feed text is vague), and emails a digest of any newly detected opportunities.
+A small helper script that scans Google News for reverse split announcements and flags situations where fractional shares might be rounded up to whole shares ("free round up" scenarios). It searches broadly, filters out clear false positives, applies price/ratio sanity checks, and looks for effective dates occurring within the next five days. The date check now combines:
+
+- Month/day parsing in feed snippets and linked articles
+- Day-of-week-only clues ("effective Monday at the open") mapped to the next matching date
+- A recency fallback that keeps reverse-split articles published within the window even if no explicit effective date is present
+
+After filtering, it emails a digest of any newly detected opportunities.
 
 ## Running locally
 
