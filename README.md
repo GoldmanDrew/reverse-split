@@ -1,39 +1,65 @@
 # reverse-split
 
-A small helper script that scans Google News for reverse split announcements and flags situations where fractional shares might be rounded up to whole shares ("free round up" scenarios). It searches broadly, filters out clear false positives, applies price/ratio sanity checks, and looks for effective dates occurring within the next five days. The date check now combines:
+Scanner for U.S. reverse stock split announcements that explicitly round fractional shares up to whole shares.
 
-- Month/day parsing in feed snippets and linked articles
-- Day-of-week-only clues ("effective Monday at the open") mapped to the next matching date
-- A recency fallback that keeps reverse-split articles published within the window even if no explicit effective date is present
+## What it does
 
-After filtering, it emails a digest of any newly detected opportunities.
+- Pulls fresh SEC filings (8-K, DEF 14A/PRE 14A, S-1/F-1 and amendments) from EDGAR.
+- Fast filter: keeps only filings that mention reverse splits and fractional-share language.
+- Deep parse: extracts ratios, effective dates, and rounding policies; classifies ROUND_UP vs. cash-in-lieu.
+- Filters out ADRs/ETFs/Canadian issuers and drops splits that would still be sub-$1.00 post-ratio.
+- Caches filings/prices/ticker metadata so the same accession is never fetched twice.
+- Writes JSON/CSV results and can optionally email a digest.
+
+## Repository layout
+
+```
+reverse-split/
+  src/
+    edgar.py     # EDGAR fetch helpers + caching
+    parse.py     # keyword filters, ratio/date/rounding extraction
+    filters.py   # ADR/ETF/Canada + rounding + price threshold filters
+    price.py     # price fetch with day-level cache
+    alert.py     # email + result writers
+  data/
+    .keep        # placeholder so the directory is tracked
+  run.py         # entrypoint orchestrating the two-stage pipeline
+  requirements.txt
+  .github/workflows/scan.yml
+```
 
 ## Running locally
 
-1. Create a Python environment with the dependencies (news feed parsing, HTML scraping for dates, price lookups):
+1. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-2. Set the email credentials (Gmail with an App Password) as environment variables. The sender defaults to `werdnamdlog01@gmail.com`, and the recipient list is hard-coded in `reverse_split.py`:
+2. Set environment variables (recommended):
    ```bash
-   # Required: Gmail app password for werdnamdlog01@gmail.com
-   export ALERT_SENDER_APP_PWD="app-password"
-
-   # Optional: override the sender address
-   export ALERT_SENDER_EMAIL="alternate@gmail.com"
+   export SEC_USER_AGENT="Your Name contact@example.com"
+   export WINDOW_HOURS=72                       # lookback window for fresh filings
+   export ALERT_SENDER_EMAIL="you@gmail.com"    # optional, required for email
+   export ALERT_SENDER_APP_PWD="app-password"   # optional, required for email
+   export ALERT_RECIPIENTS="first@ex.com,second@ex.com"
    ```
 3. Run the scanner:
    ```bash
-   python reverse_split.py
+   python run.py
    ```
-   Results that pass all filters for the most recent run are written to `reverse_split_results.json` in the repository root so you can inspect them even if no email is sent.
+   Results are written to `data/results.json` (and CSV) and cached filings/prices are stored under `data/`.
 
 ## Automation (GitHub Actions)
 
-A scheduled GitHub Actions workflow runs the scanner every day at **9:00 UTC** and sends the email alert to the configured recipients. To enable it:
+`.github/workflows/scan.yml` schedules runs twice per weekday. To enable alerts, add the following repository secrets:
 
-1. Add the repository secret `ALERT_SENDER_APP_PWD` with the Gmail app password for `werdnamdlog01@gmail.com`. If you need to override the sender address, also add the optional `ALERT_SENDER_EMAIL` secret.
-2. Ensure the default branch contains the workflow at `.github/workflows/daily-email.yml`.
-3. Keep `reverse_split.py` and `requirements.txt` in the repository root so the workflow can install dependencies and run the scanner.
+- `SEC_USER_AGENT` – required by the SEC for scripted access (e.g., `Your Name contact@example.com`).
+- `ALERT_SENDER_EMAIL`, `ALERT_SENDER_APP_PWD`, `ALERT_RECIPIENTS` for Gmail-based email delivery.
 
-The workflow installs dependencies, executes the scanner, and sends the daily digest email when any new qualifying items are found.
+The workflow installs dependencies, executes `python run.py`, and uploads `data/results.json` as an artifact.
+
+## Why this approach
+
+- SEC filings + exhibits are the source of truth for reverse split terms and rounding policies.
+- Two-stage pipeline keeps it fast: keyword prefilter, then detailed extraction only for candidates.
+- Caching and accession dedupe prevent repeated downloads and price lookups.
+- Filters focus on actionable events: ROUND_UP language, near-term effective dates, and post-split price sanity.

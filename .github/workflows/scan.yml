@@ -1,0 +1,32 @@
+name: Reverse split scan
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'
+    - cron: '0 17 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run scanner
+        env:
+          ALERT_SENDER_EMAIL: ${{ secrets.ALERT_SENDER_EMAIL }}
+          ALERT_SENDER_APP_PWD: ${{ secrets.ALERT_SENDER_APP_PWD }}
+          ALERT_RECIPIENTS: ${{ secrets.ALERT_RECIPIENTS }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          python run.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-split-results
+          path: data/results.json
