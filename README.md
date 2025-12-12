@@ -34,9 +34,9 @@ reverse-split/
    ```bash
    pip install -r requirements.txt
    ```
-2. Set environment variables (recommended):
+2. Set environment variables (recommended). The SEC requires a descriptive user agent **with your contact information**; otherwise requests will be blocked with 403 responses:
    ```bash
-   export SEC_USER_AGENT="Your Name contact@example.com"
+   export SEC_USER_AGENT="Your Name contact@example.com reverse-split-monitor/0.1"
    export WINDOW_HOURS=72                       # lookback window for fresh filings
    export ALERT_SENDER_EMAIL="you@gmail.com"    # optional, required for email
    export ALERT_SENDER_APP_PWD="app-password"   # optional, required for email

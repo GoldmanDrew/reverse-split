@@ -22,7 +22,12 @@ USER_AGENT = os.environ.get("SEC_USER_AGENT", edgar.USER_AGENT)
 
 class Runner:
     def __init__(self):
+        if not USER_AGENT or "@" not in USER_AGENT:
+            raise ValueError(
+                "SEC_USER_AGENT must include contact information (name and email) to avoid SEC 403 responses."
+            )
         self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT})
         self.filing_cache = edgar.FilingCache(CACHE_FILINGS)
         self.price_cache = price.PriceCache(CACHE_PRICES)
         self.seen = edgar.SeenAccessions(SEEN_ACCESSIONS)

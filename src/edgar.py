@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional
 import feedparser
 import requests
 
-USER_AGENT = "reverse-split-monitor/0.1"
+USER_AGENT = "reverse-split-monitor/0.1 (contact@example.com)"
 
 
 @dataclass
@@ -91,7 +91,7 @@ class TickerMap:
         if self._mapping:
             return
         url = "https://www.sec.gov/files/company_tickers_exchange.json"
-        resp = session.get(url, headers={"User-Agent": user_agent}, timeout=30)
+        resp = session.get(url, headers=_sec_headers(user_agent), timeout=30)
         resp.raise_for_status()
         data = resp.json()
         for entry in data.values():
@@ -155,7 +155,7 @@ def fetch_recent_filings(forms: Iterable[str], window_hours: int, session: reque
             "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&owner=include"
             f"&type={form}&count=200&output=atom"
         )
-        feed = session.get(url, headers={"User-Agent": user_agent}, timeout=30)
+        feed = session.get(url, headers=_sec_headers(user_agent), timeout=30)
         feed.raise_for_status()
         parsed = feedparser.parse(feed.text)
         for entry in parsed.entries:
@@ -174,10 +174,19 @@ def fetch_filing_text(filing: Filing, cache: FilingCache, session: requests.Sess
     cached = cache.get(filing.accession)
     if cached:
         return cached
-    resp = session.get(filing.text_url, headers={"User-Agent": user_agent}, timeout=30)
+    resp = session.get(filing.text_url, headers=_sec_headers(user_agent), timeout=30)
     if resp.status_code != 200:
         return None
     text = resp.text
     cache.set(filing.accession, text)
     return text
+
+
+def _sec_headers(user_agent: str) -> Dict[str, str]:
+    return {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
