@@ -40,18 +40,9 @@ def passes_rounding_policy(policy: str) -> bool:
     return policy == ROUND_UP
 
 
-def passes_price_threshold(price: Optional[float], ratio_new: Optional[int], ratio_old: Optional[int]) -> bool:
-    if price is None or not ratio_new or not ratio_old:
-        return False
-    multiplier = ratio_old / ratio_new
-    return price * multiplier >= 1
-
-
-def summarize_rejection(text: str, meta: SecurityInfo, policy: str, price: Optional[float], ratio_new: Optional[int], ratio_old: Optional[int]) -> Optional[str]:
+def summarize_rejection(text: str, meta: SecurityInfo, policy: str, ratio_new: Optional[int], ratio_old: Optional[int]) -> Optional[str]:
     if not passes_security_filters(text, meta):
         return "Excluded security type (ADR/ETF/Canada)"
     if not passes_rounding_policy(policy):
         return "Rounding policy not round-up"
-    if not passes_price_threshold(price, ratio_new, ratio_old):
-        return "Fails price * ratio threshold"
     return None

@@ -7,8 +7,8 @@ Scanner for U.S. reverse stock split announcements that explicitly round fractio
 - Pulls fresh SEC filings (8-K, DEF 14A/PRE 14A, S-1/F-1 and amendments) from EDGAR.
 - Fast filter: keeps only filings that mention reverse splits and fractional-share language.
 - Deep parse: extracts ratios, effective dates, and rounding policies; classifies ROUND_UP vs. cash-in-lieu.
-- Filters out ADRs/ETFs/Canadian issuers and drops splits that would still be sub-$1.00 post-ratio.
-- Caches filings/prices/ticker metadata so the same accession is never fetched twice.
+- Filters out ADRs/ETFs/Canadian issuers and keeps only ROUND_UP policies.
+- Caches filings/ticker metadata so the same accession is never fetched twice.
 - Writes JSON/CSV results and can optionally email a digest.
 
 ## Repository layout
@@ -18,8 +18,7 @@ reverse-split/
   src/
     edgar.py     # EDGAR fetch helpers + caching
     parse.py     # keyword filters, ratio/date/rounding extraction
-    filters.py   # ADR/ETF/Canada + rounding + price threshold filters
-    price.py     # price fetch with day-level cache
+    filters.py   # ADR/ETF/Canada + rounding filters
     alert.py     # email + result writers
   data/
     .keep        # placeholder so the directory is tracked
@@ -46,7 +45,7 @@ reverse-split/
    ```bash
    python run.py
    ```
-   Results are written to `data/results.json` (and CSV) and cached filings/prices are stored under `data/`.
+   Results are written to `data/results.json` (and CSV) and cached filings are stored under `data/`.
 
 ## Automation (GitHub Actions)
 
@@ -61,5 +60,5 @@ The workflow installs dependencies, executes `python run.py`, and uploads `data/
 
 - SEC filings + exhibits are the source of truth for reverse split terms and rounding policies.
 - Two-stage pipeline keeps it fast: keyword prefilter, then detailed extraction only for candidates.
-- Caching and accession dedupe prevent repeated downloads and price lookups.
-- Filters focus on actionable events: ROUND_UP language, near-term effective dates, and post-split price sanity.
+- Caching and accession dedupe prevent repeated downloads.
+- Filters focus on actionable events: ROUND_UP language and near-term effective dates.
