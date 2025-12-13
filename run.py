@@ -36,6 +36,7 @@ class Runner:
 
     def run(self) -> List[dict]:
         filings = edgar.fetch_recent_filings(edgar.FORMS_OF_INTEREST, WINDOW_HOURS, self.session, USER_AGENT)
+        print(f"Fetched {len(filings)} filings")
         results: List[dict] = []
         for filing in filings:
             if filing.accession in self.seen:

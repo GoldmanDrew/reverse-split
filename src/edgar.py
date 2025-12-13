@@ -90,18 +90,69 @@ class TickerMap:
     def refresh(self, session: requests.Session, user_agent: str) -> None:
         if self._mapping:
             return
+
         url = "https://www.sec.gov/files/company_tickers_exchange.json"
         resp = session.get(url, headers=_sec_headers(user_agent), timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        for entry in data.values():
-            cik_str = str(entry["cik_str"]).zfill(10)
+        payload = resp.json()
+
+        # New SEC format:
+        # {"fields":["cik","name","ticker","exchange"], "data":[[cik,name,ticker,exchange], ...]}
+        if isinstance(payload, dict) and "fields" in payload and "data" in payload:
+            fields = payload["fields"]
+            rows = payload["data"]
+
+            # Map field name -> column index
+            idx = {name: i for i, name in enumerate(fields)}
+
+            cik_i = idx.get("cik")
+            name_i = idx.get("name")
+            ticker_i = idx.get("ticker")
+            exch_i = idx.get("exchange")
+
+            for row in rows:
+                try:
+                    cik_val = row[cik_i] if cik_i is not None else None
+                    if cik_val is None:
+                        continue
+                    cik_str = str(int(cik_val)).zfill(10)
+
+                    self._mapping[cik_str] = {
+                        "ticker": (row[ticker_i] or "").upper() if ticker_i is not None else "",
+                        "exchange": (row[exch_i] or "").upper() if exch_i is not None else "",
+                        "title": row[name_i] if name_i is not None else "",
+                    }
+                except Exception:
+                    # skip malformed rows
+                    continue
+
+            self.save()
+            return
+
+        # Old SEC formats (fallbacks):
+        # - dict keyed by row number {"0":{"cik_str":...}, ...}
+        # - list of dicts [{"cik_str":...}, ...]
+        if isinstance(payload, dict):
+            it = payload.values()
+        elif isinstance(payload, list):
+            it = payload
+        else:
+            it = []
+
+        for entry in it:
+            if not isinstance(entry, dict):
+                continue
+            cik_str = str(entry.get("cik_str") or entry.get("cik") or "").zfill(10)
+            if not cik_str.strip("0"):
+                continue
             self._mapping[cik_str] = {
-                "ticker": entry.get("ticker", "").upper(),
-                "exchange": entry.get("exchange", "").upper(),
-                "title": entry.get("title", ""),
+                "ticker": str(entry.get("ticker", "")).upper(),
+                "exchange": str(entry.get("exchange", "")).upper(),
+                "title": str(entry.get("title") or entry.get("name") or ""),
             }
+
         self.save()
+
 
     def lookup(self, cik: str) -> Dict[str, str]:
         return self._mapping.get(cik, {})
@@ -118,33 +169,89 @@ FORMS_OF_INTEREST = [
     "F-1/A",
 ]
 
+import re
+
+_ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
+_CIK_RE = re.compile(r"\((\d{10})\)")
+_FORM_RE = re.compile(r"^([A-Z0-9\-\/ ]+)\s+-\s+")
+
+def _first_link_href(entry) -> str:
+    # feedparser entries often have .links list, with dicts containing 'href'
+    links = getattr(entry, "links", None)
+    if links and isinstance(links, list):
+        for l in links:
+            href = l.get("href") if isinstance(l, dict) else None
+            if href:
+                return href
+    # fallback
+    return entry.get("link") or entry.get("id", "")
 
 def _parse_entry(entry) -> Optional[Filing]:
-    accession = entry.get("accession-number") or entry.get("accessionnumber")
-    if not accession:
-        # fallback: try from id
-        entry_id = entry.get("id", "")
-        parts = entry_id.split("/")
-        if parts:
-            accession = parts[-1].replace("-index.htm", "")
-    link = entry.get("link") or entry.get("id", "")
-    if not accession or not link:
+    title = (entry.get("title") or "").strip()
+    if not title:
         return None
+
+    link = _first_link_href(entry)
+    if not link:
+        return None
+
+    # Accession: prefer extracting from link, else from entry.id urn
+    accession = None
+    m = _ACCESSION_RE.search(link)
+    if m:
+        accession = m.group(1)
+    else:
+        entry_id = entry.get("id", "")
+        if entry_id and "accession-number=" in entry_id:
+            accession = entry_id.split("accession-number=")[-1].strip()
+
+    if not accession:
+        return None
+
+    # CIK: often present in title like "(0001083743)"
+    cik = ""
+    m = _CIK_RE.search(title)
+    if m:
+        cik = m.group(1)
+    else:
+        # sometimes feedparser provides cik in other fields; keep fallback
+        cik = str(entry.get("cik", "")).zfill(10) if entry.get("cik") else ""
+
+    # Form: usually prefix of title like "8-K - Company (CIK) (Filer)"
+    form = ""
+    m = _FORM_RE.match(title)
+    if m:
+        form = m.group(1).strip()
+    else:
+        # fallback: feedparser sometimes provides tags/categories in other places
+        form = entry.get("filing-type", "") or ""
+
+    # Company name: strip leading "FORM - " and trailing "(CIK) (Filer)"
+    company = title
+    if " - " in company:
+        company = company.split(" - ", 1)[1]
+    # remove CIK and trailing parentheses bits
+    company = re.sub(r"\(\d{10}\)\s*\(Filer\)\s*$", "", company).strip()
+
+    # Filed date: Atom 'updated' exists and is reliable enough for window filter
+    filed_str = entry.get("updated") or entry.get("published") or ""
+    if filed_str:
+        filed_at = datetime.strptime(filed_str.split("T")[0], "%Y-%m-%d")
+    else:
+        filed_at = datetime.utcnow()
+
     text_url = link.replace("-index.htm", ".txt")
-    cik = entry.get("cik", "").zfill(10)
-    company = entry.get("company-name", entry.get("title", "")).strip()
-    form = entry.get("category", {}).get("term") or entry.get("filing-type", "")
-    filed_str = entry.get("filing-date") or entry.get("updated")
-    filed_at = datetime.strptime(filed_str.split("T")[0], "%Y-%m-%d") if filed_str else datetime.utcnow()
+
     return Filing(
         accession=accession,
-        cik=cik,
+        cik=cik.zfill(10) if cik else "",
         company=company,
         form=form,
         filed_at=filed_at,
         link=link,
         text_url=text_url,
     )
+
 
 
 def fetch_recent_filings(forms: Iterable[str], window_hours: int, session: requests.Session, user_agent: str) -> List[Filing]:
