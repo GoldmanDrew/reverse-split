@@ -94,7 +94,6 @@ def passes_price_threshold(price: Optional[float], ratio_new: Optional[int], rat
     multiplier = ratio_old / ratio_new
     return price * multiplier >= 1
 
-
 def summarize_rejection(
     text: str,
     meta: SecurityInfo,
