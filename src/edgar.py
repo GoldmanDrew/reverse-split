@@ -88,8 +88,10 @@ class TickerMap:
         self.path.write_text(json.dumps(self._mapping, indent=2))
 
     def refresh(self, session: requests.Session, user_agent: str) -> None:
-        if self._mapping:
+        # refresh if empty OR older than 7 days
+        if self._mapping and self.path.exists() and (time.time() - self.path.stat().st_mtime) < 7*24*3600:
             return
+
 
         url = "https://www.sec.gov/files/company_tickers_exchange.json"
         resp = session.get(url, headers=_sec_headers(user_agent), timeout=30)

@@ -31,14 +31,11 @@ class Extraction:
 
 
 def contains_reverse_split_language(text: str) -> bool:
-    keywords = [
-        "reverse stock split",
-        "reverse split",
-        "share consolidation",
-    ]
-    rounding = ["rounded up", "in lieu", "fractional"]
-    text_lower = text.lower()
-    return any(k in text_lower for k in keywords) and any(r in text_lower for r in rounding)
+    t = text.lower()
+    keywords = ["reverse stock split", "reverse split", "share consolidation", "stock consolidation"]
+    verbs = ["became effective", "will become effective", "effective on", "approved", "filed", "certificate of amendment"]
+
+    return any(k in t for k in keywords) and any(v in t for v in verbs)
 
 
 def extract_ratio(text: str) -> (Optional[int], Optional[int]):
@@ -68,17 +65,42 @@ def _contains_words(text: str, words) -> bool:
     text_lower = text.lower()
     return any(word in text_lower for word in words)
 
-
 def classify_rounding_policy(text: str) -> str:
-    text_lower = text.lower()
-    if "rounded up" in text_lower or "rounding up" in text_lower:
+    t = text.lower()
+
+    # Normalize whitespace to handle SEC .txt weird line breaks
+    t_norm = re.sub(r"\s+", " ", t)
+
+    # 1) Strong ROUND_UP: "additional share(s) ... in lieu of ... fractional share(s)"
+    # Handles: "receive an additional share", "one additional share", "additional shares"
+    if re.search(
+        r"(receive|entitled to receive|shall receive).{0,120}additional\s+share(s)?"
+        r".{0,180}in\s+lieu\s+of\s+(a\s+)?fractional\s+share(s)?",
+        t_norm,
+    ):
         return ROUND_UP
-    if "receive one" in text_lower and "in lieu" in text_lower:
+
+    # 2) Strong ROUND_UP: "rounded up to the nearest whole share"
+    if re.search(r"rounded\s+up\s+to\s+the\s+nearest\s+whole\s+share", t_norm):
         return ROUND_UP
-    if "cash in lieu" in text_lower or "paid cash" in text_lower:
+
+    # 3) Strong CASH_IN_LIEU: cash language near fractional language
+    # (Important: require proximity so random "cash" elsewhere doesn't poison it.)
+    if re.search(
+        r"(cash\s+in\s+lieu|entitled to receive cash|will receive cash|paid\s+cash|cash\s+equal\s+to)"
+        r".{0,250}(fractional|fraction\s+of\s+one\s+share)",
+        t_norm,
+    ) or re.search(
+        r"(fractional|fraction\s+of\s+one\s+share).{0,250}"
+        r"(cash\s+in\s+lieu|entitled to receive cash|will receive cash|paid\s+cash|cash\s+equal\s+to)",
+        t_norm,
+    ):
         return CASH_IN_LIEU
-    if "no fractional shares" in text_lower and "issued" in text_lower:
+
+    # 4) Fractionals issued (rare)
+    if re.search(r"fractional\s+share(s)?.{0,120}(will|shall)\s+be\s+(issued|distributed|delivered)", t_norm):
         return FRACTIONAL_ISSUED
+
     return UNKNOWN
 
 
