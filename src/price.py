@@ -1,8 +1,13 @@
+import csv
 import json
 from datetime import date
 from pathlib import Path
 from typing import Dict, Optional
 
+import requests
+
+# yfinance remains available for callers that still rely on it, but new
+# functionality below uses the lighter-weight Stooq endpoint.
 import yfinance as yf
 
 
@@ -30,6 +35,51 @@ class PriceCache:
     def set(self, ticker: str, as_of: date, price: float) -> None:
         ticker_key = ticker.upper()
         self._data.setdefault(ticker_key, {})[as_of.isoformat()] = price
+
+
+def fetch_stooq_close(ticker: str, cache: PriceCache, session: Optional[requests.Session] = None) -> Optional[float]:
+    """
+    Fetch the latest close price from Stooq.
+
+    Stooq's CSV endpoint is lightweight and doesn't require auth. We cache prices
+    by ticker and date to avoid repeated network calls. This should be invoked
+    *after* all policy filters have already been applied.
+    """
+
+    today = date.today()
+    cached = cache.get(ticker, today)
+    if cached is not None:
+        return cached
+
+    ticker_key = (ticker or "").strip().lower()
+    if not ticker_key:
+        return None
+
+    symbol = f"{ticker_key}.us"
+    url = f"https://stooq.pl/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
+    sess = session or requests.Session()
+
+    try:
+        resp = sess.get(url, timeout=10)
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 200 or not resp.text:
+        return None
+
+    reader = csv.DictReader(resp.text.splitlines())
+    row = next(reader, None)
+    if not row:
+        return None
+
+    close_raw = row.get("Close") or row.get("close")
+    try:
+        close = float(close_raw)
+    except (TypeError, ValueError):
+        return None
+
+    cache.set(ticker, today, close)
+    return close
 
 
 def fetch_close_price(ticker: str, cache: PriceCache) -> Optional[float]:
