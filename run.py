@@ -6,7 +6,7 @@ from typing import List
 
 import requests
 
-from src import alert, edgar, filters, parse
+from src import alert, edgar, filters, parse, price
 
 DATA_DIR = Path("data")
 RESULTS_JSON = DATA_DIR / "results.json"
@@ -14,6 +14,7 @@ RESULTS_CSV = DATA_DIR / "results.csv"
 CACHE_FILINGS = DATA_DIR / "cache_filings.json"
 SEEN_ACCESSIONS = DATA_DIR / "seen_accessions.json"
 TICKER_MAP_PATH = DATA_DIR / "ticker_map.json"
+PRICE_CACHE_PATH = Path("price_cache.json")
 
 WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "72"))
 WINDOW_HOURS = 720
@@ -35,6 +36,7 @@ class Runner:
         self.seen = edgar.SeenAccessions(SEEN_ACCESSIONS)
         self.tickers = edgar.TickerMap(TICKER_MAP_PATH)
         self.tickers.refresh(self.session, USER_AGENT)
+        self.price_cache = price.PriceCache(PRICE_CACHE_PATH)
 
     def run(self) -> List[dict]:
         filings = edgar.fetch_recent_filings(edgar.FORMS_OF_INTEREST, WINDOW_HOURS, self.session, USER_AGENT)
@@ -87,14 +89,11 @@ class Runner:
             title = meta.get("title", filing.company)
             sec_info = filters.SecurityInfo(ticker=ticker, exchange=exchange, title=title)
 
-            # Price checks removed entirely. Keep a placeholder for schema stability.
-            px = None
-
             rejection = filters.summarize_rejection(
                 text=text,
                 meta=sec_info,
                 policy=extraction.rounding_policy,
-                price=px,
+                price=None,
                 ratio_new=extraction.ratio_new,
                 ratio_old=extraction.ratio_old,
             )
@@ -109,8 +108,11 @@ class Runner:
                 "filed_at": filing.filed_at.isoformat(),
                 "effective_date": extraction.effective_date.isoformat() if extraction.effective_date else None,
                 "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}" if extraction.ratio_new else None,
+                "ratio_new": extraction.ratio_new,
+                "ratio_old": extraction.ratio_old,
                 "rounding_policy": extraction.rounding_policy,
-                "price": px,
+                "price": None,
+                "potential_profit": None,
                 "rejection_reason": rejection,
             }
             print(
@@ -139,11 +141,50 @@ class Runner:
 
         self.filing_cache.save()
         self.seen.save()
+        self._enrich_with_stooq(results)
         alert.write_json(RESULTS_JSON, results)
         alert.write_csv(RESULTS_CSV, results)
 
         print("Filter stats:", counts)
         return results
+
+    def _enrich_with_stooq(self, results: List[dict]) -> None:
+        """Fetch prices for accepted results and compute potential profit."""
+
+        if not results:
+            return
+
+        for record in results:
+            ticker = record.get("ticker")
+            ratio_new = record.get("ratio_new")
+            ratio_old = record.get("ratio_old")
+
+            px = price.fetch_stooq_close(ticker, self.price_cache, self.session)
+            record["price"] = px
+
+            potential = None
+            if px is not None and ratio_new and ratio_old:
+                potential = round(px * (ratio_old / ratio_new), 4)
+            record["potential_profit"] = potential
+
+        self.price_cache.save()
+        self._print_profit_estimates(results)
+
+    def _print_profit_estimates(self, results: List[dict]) -> None:
+        print("\nStooq potential profit estimates:")
+        for record in results:
+            ticker = record.get("ticker")
+            profit = record.get("potential_profit")
+            price_val = record.get("price")
+            ratio_display = record.get("ratio_display") or "n/a"
+
+            if profit is None or price_val is None:
+                print(f" - {ticker}: missing price/ratio data")
+                continue
+
+            print(
+                f" - {ticker}: pre-split price ${price_val:.4f} -> potential profit ${profit:.4f} ({ratio_display})"
+            )
 
 
 def maybe_email(results: List[dict]) -> None:
