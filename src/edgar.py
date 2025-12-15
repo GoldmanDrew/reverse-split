@@ -92,7 +92,6 @@ class TickerMap:
         if self._mapping and self.path.exists() and (time.time() - self.path.stat().st_mtime) < 7*24*3600:
             return
 
-
         url = "https://www.sec.gov/files/company_tickers_exchange.json"
         resp = session.get(url, headers=_sec_headers(user_agent), timeout=30)
         resp.raise_for_status()
@@ -253,8 +252,6 @@ def _parse_entry(entry) -> Optional[Filing]:
         link=link,
         text_url=text_url,
     )
-
-
 
 def fetch_recent_filings(forms: Iterable[str], window_hours: int, session: requests.Session, user_agent: str) -> List[Filing]:
     cutoff = datetime.utcnow() - timedelta(hours=window_hours)

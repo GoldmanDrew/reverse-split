@@ -115,22 +115,20 @@ class Runner:
                 "potential_profit": None,
                 "rejection_reason": rejection,
             }
-            print(
-                "Beneficient in fetched filings:",
-                any(f.cik == "0002088749" for f in filings)
-            )
+
             if filing.cik == "0002088749":
-                print("DEBUG Beneficient:", {
-                    "accession": filing.accession,
-                    "form": filing.form,
-                    "filed_at": filing.filed_at,
-                })
-                print("DEBUG policy before rejection:", extraction.rounding_policy)
-                tl = text.lower()
-                i = tl.find("fraction")
-                print("---- Beneficient fractional context ----")
-                print(text[max(0, i-500): i+800])
+                ctx = parse.extract_reverse_split_context(text)
+                print("---- Beneficient reverse-split context ----")
+                print(ctx[:4000])  # show first 4k chars of the scoped section
                 print("---- end ----")
+                extraction_dbg = parse.extract_details(text, filed_at=filing.filed_at)
+                print("DEBUG policy:", extraction_dbg.rounding_policy)
+                tl = text.lower()
+                print("has 'reverse stock split'?:", "reverse stock split" in tl)
+                print("has 'additional share'?:", "additional share" in tl)
+                print("has 'in lieu of a fractional share'?:", "in lieu of a fractional share" in tl)
+                print("has 'cash in lieu'?:", "cash in lieu" in tl)
+
 
             if rejection is None:
                 results.append(record)
