@@ -96,3 +96,15 @@ def fetch_close_price(ticker: str, cache: PriceCache) -> Optional[float]:
     last_close = float(data["Close"].iloc[-1])
     cache.set(ticker, today, last_close)
     return last_close
+
+
+def fetch_price_with_fallback(
+    ticker: str, cache: PriceCache, session: Optional[requests.Session] = None
+) -> Optional[float]:
+    """Try Stooq first, then fall back to Yahoo Finance if missing."""
+
+    stooq_px = fetch_stooq_close(ticker, cache, session=session)
+    if stooq_px is not None:
+        return stooq_px
+
+    return fetch_close_price(ticker, cache)

@@ -157,7 +157,7 @@ class Runner:
             ratio_new = record.get("ratio_new")
             ratio_old = record.get("ratio_old")
 
-            px = price.fetch_stooq_close(ticker, self.price_cache, self.session)
+            px = price.fetch_price_with_fallback(ticker, self.price_cache, self.session)
             record["price"] = px
 
             potential = None
@@ -175,9 +175,18 @@ class Runner:
             profit = record.get("potential_profit")
             price_val = record.get("price")
             ratio_display = record.get("ratio_display") or "n/a"
+            ratio_new = record.get("ratio_new")
+            ratio_old = record.get("ratio_old")
 
-            if profit is None or price_val is None:
-                print(f" - {ticker}: missing price/ratio data")
+            missing_fields = []
+            if price_val is None:
+                missing_fields.append("price")
+            if not ratio_new or not ratio_old:
+                missing_fields.append("ratio")
+
+            if missing_fields:
+                missing_display = "/".join(missing_fields)
+                print(f" - {ticker}: missing {missing_display} data")
                 continue
 
             print(
