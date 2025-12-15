@@ -20,7 +20,6 @@ RATIO_PATTERN = re.compile(
     r"(?P<new>\d{1,3})\s*[- ]?for\s*[- ]?(?P<old>\d{1,3})", re.IGNORECASE
 )
 
-
 @dataclass
 class Extraction:
     ratio_new: Optional[int]
@@ -28,24 +27,6 @@ class Extraction:
     effective_date: Optional[datetime]
     rounding_policy: str
     matches_rounding: bool
-
-
-def contains_reverse_split_language(text: str) -> bool:
-    context = extract_reverse_split_context(text)
-    if not context:
-        return False
-
-    t = context.lower()
-    return any(
-        k in t
-        for k in [
-            "reverse stock split",
-            "reverse split",
-            "share consolidation",
-            "stock consolidation",
-            "reverse share split",
-        ]
-    )
 
 
 def extract_ratio(text: str) -> (Optional[int], Optional[int]):
@@ -70,27 +51,77 @@ def extract_effective_date(text: str, fallback: Optional[datetime]) -> Optional[
             continue
     return fallback
 
-def extract_reverse_split_context(text: str, window: int = 1500) -> str:
-    """
-    Extract a local text window around the first occurrence of
-    reverse-split language to avoid contamination from unrelated
-    sections (e.g., warrants, options, trust agreements).
-    """
+import re
+
+def extract_reverse_split_context(text: str, window: int = 3500) -> str:
     t = text.lower()
-    keywords = [
+
+    # High-signal anchors first
+    strong = [
         "reverse stock split",
         "reverse split",
-        "share consolidation",
-        "stock consolidation",
-        "reverse share split",
+        "split-adjusted",
+        "trading on a split-adjusted basis",
+        "certificate of amendment",
     ]
 
-    for k in keywords:
+    for k in strong:
         i = t.find(k)
         if i != -1:
             return text[max(0, i - window): i + window]
 
-    return ""
+    # Weak anchors last (noisy; used only as fallback)
+    weak = [
+        "share consolidation",
+        "stock consolidation",
+    ]
+
+    # If we must fall back, pick the best-looking weak hit (see Fix 2)
+    candidates = []
+    for k in weak:
+        start = 0
+        while True:
+            i = t.find(k, start)
+            if i == -1:
+                break
+            snippet = text[max(0, i - window): i + window]
+            candidates.append(snippet)
+            start = i + len(k)
+
+    if not candidates:
+        return ""
+
+    # Score snippets: prefer ones that ALSO mention reverse-split-y words
+    def score(sn: str) -> int:
+        s = sn.lower()
+        pos = 0
+        pos += 5 if "reverse" in s else 0
+        pos += 5 if "stock split" in s else 0
+        pos += 3 if "effective" in s else 0
+        pos += 3 if "split-adjusted" in s else 0
+        pos += 2 if "common stock" in s else 0
+        pos += 2 if "ratio" in s else 0
+        # Penalize charter/conversion boilerplate
+        neg = 0
+        neg += 6 if "class a" in s and "class b" in s else 0
+        neg += 4 if "conversion" in s else 0
+        neg += 3 if "articles" in s else 0
+        return pos - neg
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
+
+
+def contains_reverse_split_language(text: str) -> bool:
+    t = text.lower()
+    strong = [
+        "reverse stock split",
+        "reverse split",
+        "split-adjusted",
+        "trading on a split-adjusted basis",
+    ]
+    return any(k in t for k in strong)
+
 
 
 def _contains_words(text: str, words) -> bool:
@@ -121,11 +152,17 @@ def classify_rounding_policy(text: str) -> str:
 
 
 def extract_details(text: str, filed_at: datetime) -> Extraction:
-    context = extract_reverse_split_context(text)
+    ctx = extract_reverse_split_context(text)
+    ctx_l = ctx.lower()
 
-    ratio_new, ratio_old = extract_ratio(context)
-    effective = extract_effective_date(context, filed_at)
-    rounding = classify_rounding_policy(context)
+    # If the "context" doesn't actually contain reverse split language, don't pretend it does
+    if "reverse stock split" not in ctx_l and "reverse split" not in ctx_l:
+        rounding = UNKNOWN
+    else:
+        rounding = classify_rounding_policy(ctx)
+
+    ratio_new, ratio_old = extract_ratio(ctx)
+    effective = extract_effective_date(ctx, filed_at)
 
     return Extraction(
         ratio_new=ratio_new,
@@ -134,4 +171,5 @@ def extract_details(text: str, filed_at: datetime) -> Extraction:
         rounding_policy=rounding,
         matches_rounding=rounding != UNKNOWN,
     )
+
 
