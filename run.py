@@ -3,9 +3,10 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import List
+from zoneinfo import ZoneInfo
 
 import requests
-
+import re
 from src import alert, edgar, filters, parse, price
 
 DATA_DIR = Path("data")
@@ -17,11 +18,30 @@ TICKER_MAP_PATH = DATA_DIR / "ticker_map.json"
 PRICE_CACHE_PATH = Path("price_cache.json")
 
 WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "72"))
-WINDOW_HOURS = 720
+WINDOW_HOURS = 388
+
 USER_AGENT = os.environ.get("SEC_USER_AGENT", edgar.USER_AGENT)
 
 # If set to "1", ignore seen_accessions.json and reprocess filings in-window.
 FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS", "0") == "1"
+FORCE_REPROCESS = 1
+
+
+def today_et():
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
+def derive_common_ticker_from_map(ticker_map: str) -> str | None:
+    """
+    If SEC's single-ticker mapping points to a non-common instrument (often warrants),
+    try a simple transformation to the common ticker.
+
+    Example: BENFW -> BENF
+    """
+    t = (ticker_map or "").upper().strip()
+    if t.endswith("W") and len(t) >= 2:
+        return t[:-1]
+    return None
 
 
 class Runner:
@@ -30,17 +50,32 @@ class Runner:
             raise ValueError(
                 "SEC_USER_AGENT must include contact information (name and email) to avoid SEC 403 responses."
             )
+
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+
         self.filing_cache = edgar.FilingCache(CACHE_FILINGS)
         self.seen = edgar.SeenAccessions(SEEN_ACCESSIONS)
         self.tickers = edgar.TickerMap(TICKER_MAP_PATH)
         self.tickers.refresh(self.session, USER_AGENT)
+
         self.price_cache = price.PriceCache(PRICE_CACHE_PATH)
 
     def run(self) -> List[dict]:
-        filings = edgar.fetch_recent_filings(edgar.FORMS_OF_INTEREST, WINDOW_HOURS, self.session, USER_AGENT)
-        print(f"Fetched {len(filings)} filings")
+        # Option B: universe scan via submissions JSON (no daily index)
+        filings = edgar.fetch_recent_filings_via_submissions_universe(
+            edgar.FORMS_OF_INTEREST,
+            WINDOW_HOURS,
+            self.session,
+            USER_AGENT,
+            data_dir=DATA_DIR,
+            batch_size= 999999,#int(os.environ.get("CIK_BATCH_SIZE", "1200")),
+            limit_per_cik=int(os.environ.get("LIMIT_PER_CIK", "25")),
+            window_days_floor=8,
+            debug=True,
+        )
+
+        print(f"Fetched {len(filings)} filings (submissions universe batch)")
 
         counts = {
             "total": 0,
@@ -53,21 +88,23 @@ class Runner:
         }
 
         results: List[dict] = []
+
         for filing in filings:
             counts["total"] += 1
 
-            # IMPORTANT: if a filing was previously rejected due to a transient issue
-            # (e.g., Yahoo price lookup), you don't want it to be permanently skipped.
-            # Two safeguards:
-            #   1) FORCE_REPROCESS=1 ignores seen.
-            #   2) We only add to seen AFTER we confirm it's a reverse-split candidate.
             if not FORCE_REPROCESS and filing.accession in self.seen:
                 counts["skipped_seen"] += 1
                 continue
 
-            text = edgar.fetch_filing_text(filing, self.filing_cache, self.session, USER_AGENT)
+            text = edgar.fetch_filing_text(
+                filing, self.filing_cache, self.session, USER_AGENT
+            )
             if not text:
                 counts["no_text"] += 1
+                continue
+
+            if parse.is_delisting_notice_only(text):
+                counts["rejected_by_policy"] += 1
                 continue
 
             if not parse.contains_reverse_split_language(text):
@@ -76,17 +113,63 @@ class Runner:
 
             counts["reverse_lang"] += 1
 
-            # Mark as seen ONLY once we know it matched the reverse-split detector.
-            # This avoids permanently skipping filings that were rejected due to
-            # later-stage filters you might change in the future.
             if not FORCE_REPROCESS:
                 self.seen.add(filing.accession)
 
             extraction = parse.extract_details(text, filed_at=filing.filed_at)
+
             meta = self.tickers.lookup(filing.cik)
-            ticker = meta.get("ticker") or filing.cik
-            exchange = meta.get("exchange", "")
+            ticker_map = (meta.get("ticker") or "").upper().strip()
+            exchange_map = (meta.get("exchange") or "").upper().strip()
+            exchange = exchange_map  # working var
             title = meta.get("title", filing.company)
+
+            # -----------------------------
+            # Ticker decision (robust)
+            # Priority:
+            #   1) Parse 8-K trading symbol table if present
+            #   2) If SEC-mapped ticker is non-common, derive a common ticker (e.g., BENFW -> BENF)
+            #   3) Fall back to SEC mapping
+            # -----------------------------
+            ticker_source = "sec_map"
+            ticker = ticker_map
+
+            tkr2, exch2 = parse.extract_common_ticker_exchange(text)
+            if tkr2:
+                ticker = tkr2
+                ticker_source = "8k_trading_table"
+                # FIX: normalize exchange even if exch2 is missing
+                exchange = (exch2 or exchange_map).upper().strip()
+            else:
+                tmp_info = filters.SecurityInfo(ticker=ticker_map, exchange=exchange_map, title=title)
+                if filters.is_non_common_security(tmp_info):
+                    derived = derive_common_ticker_from_map(ticker_map)
+                    if derived:
+                        ticker = derived
+                        ticker_source = "derived_from_map"
+                        # FIX: reset exchange based on SEC mapping (don’t carry stale state)
+                        exchange = exchange_map
+
+                        # Optional safety check (slower): only accept derived if it has a price
+                        # px_check = price.fetch_price_with_fallback(derived, self.price_cache, self.session)
+                        # if px_check is None:
+                        #     ticker = ticker_map
+                        #     ticker_source = "sec_map"
+                        #     exchange = exchange_map
+
+            if filing.cik == BENF_CIK:
+                print(
+                    "BENF TICKER DECISION:",
+                    {
+                        "ticker_map": ticker_map,
+                        "final_ticker": ticker,
+                        "exchange": exchange,
+                        "source": ticker_source,
+                        "parsed_ticker": tkr2,
+                        "parsed_exchange": exch2,
+                    },
+                )
+
             sec_info = filters.SecurityInfo(ticker=ticker, exchange=exchange, title=title)
 
             rejection = filters.summarize_rejection(
@@ -98,6 +181,13 @@ class Runner:
                 ratio_old=extraction.ratio_old,
             )
 
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+
+            if extraction.effective_date.date() < today:
+                counts["rejected_by_policy"] += 1
+                print(f"Effective date already passed ({extraction.effective_date.date().isoformat()})")
+                continue
+
             record = {
                 "accession": filing.accession,
                 "company": filing.company,
@@ -106,8 +196,12 @@ class Runner:
                 "exchange": exchange,
                 "form": filing.form,
                 "filed_at": filing.filed_at.isoformat(),
-                "effective_date": extraction.effective_date.isoformat() if extraction.effective_date else None,
-                "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}" if extraction.ratio_new else None,
+                "effective_date": extraction.effective_date.isoformat()
+                if extraction.effective_date
+                else None,
+                "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}"
+                if extraction.ratio_new
+                else None,
                 "ratio_new": extraction.ratio_new,
                 "ratio_old": extraction.ratio_old,
                 "rounding_policy": extraction.rounding_policy,
@@ -115,31 +209,32 @@ class Runner:
                 "potential_profit": None,
                 "rejection_reason": rejection,
             }
-
-            if filing.cik == "0002088749":
-                ctx = parse.extract_reverse_split_context(text)
-                print("---- Beneficient reverse-split context ----")
-                print(ctx[:4000])  # show first 4k chars of the scoped section
-                print("---- end ----")
-                extraction_dbg = parse.extract_details(text, filed_at=filing.filed_at)
-                print("DEBUG policy:", extraction_dbg.rounding_policy)
-                tl = text.lower()
-                print("has 'reverse stock split'?:", "reverse stock split" in tl)
-                print("has 'additional share'?:", "additional share" in tl)
-                print("has 'in lieu of a fractional share'?:", "in lieu of a fractional share" in tl)
-                print("has 'cash in lieu'?:", "cash in lieu" in tl)
-
-
+            
             if rejection is None:
                 results.append(record)
                 counts["accepted"] += 1
             else:
                 counts["rejected_by_policy"] += 1
-                print(record['rejection_reason'])
+                print(record["rejection_reason"])
 
         self.filing_cache.save()
         self.seen.save()
+
         self._enrich_with_stooq(results)
+
+        def dedupe_events(records: list[dict]) -> list[dict]:
+            best = {}
+            for r in records:
+                eff = (r.get("effective_date") or "").split("T")[0]
+                key = (r.get("ticker"), eff, r.get("ratio_new"), r.get("ratio_old"), r.get("rounding_policy"))
+                # keep latest filed_at
+                cur = best.get(key)
+                if cur is None or (r.get("filed_at") or "") > (cur.get("filed_at") or ""):
+                    best[key] = r
+            return list(best.values())
+
+        results = dedupe_events(results)
+
         alert.write_json(RESULTS_JSON, results)
         alert.write_csv(RESULTS_CSV, results)
 
@@ -148,7 +243,6 @@ class Runner:
 
     def _enrich_with_stooq(self, results: List[dict]) -> None:
         """Fetch prices for accepted results and compute potential profit."""
-
         if not results:
             return
 
@@ -206,5 +300,6 @@ def maybe_email(results: List[dict]) -> None:
 if __name__ == "__main__":
     runner = Runner()
     results = runner.run()
+
     maybe_email(results)
     print(f"Wrote {len(results)} results to {RESULTS_JSON}")

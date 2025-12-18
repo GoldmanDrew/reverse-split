@@ -17,7 +17,7 @@ class SecurityInfo:
 # - Do NOT use broad keywords like "trust" against the full filing text.
 #   "trust" shows up constantly (transfer agents, indenture trustees, stock transfer & trust companies)
 #   and will create huge false exclusions (e.g., Beneficient).
-ADR_KEYWORDS = ["adr", "american depositary", "american depository", "depositary shares"]
+ADR_KEYWORDS = ["adr", "american depositary", "american depository"]
 
 # Keep ETF detection tight and focused
 ETF_TEXT_KEYWORDS = [
@@ -50,17 +50,28 @@ def is_adr(text: str, meta: SecurityInfo) -> bool:
 
 
 def is_etf(text: str, meta: SecurityInfo) -> bool:
-    t = _norm(text)
     title = _norm(meta.title)
-
-    # Strong title signal first (many ETFs literally contain "ETF" in the name)
     if " etf" in f" {title} " or title.endswith(" etf") or title.startswith("etf "):
         return True
 
-    # Text-based ETF detection (tight keywords only)
-    # If you ever want even fewer false positives, remove plain "etf" from ETF_TEXT_KEYWORDS
-    # and rely on the longer phrases.
-    return any(k in t for k in ETF_TEXT_KEYWORDS)
+    t = _norm(text)
+
+    strong_signals = [
+        "exchange-traded fund",
+        "exchange traded fund",
+        "open-end fund",
+        "closed-end fund",
+    ]
+    weak_signals = [
+        "investment company act of 1940",
+        "unit investment trust",
+    ]
+
+    strong = any(s in t for s in strong_signals)
+    weak = sum(1 for s in weak_signals if s in t)
+
+    # require either a strong signal, or 2+ weak signals
+    return strong or weak >= 2
 
 
 def is_canadian(text: str, meta: SecurityInfo) -> bool:
@@ -77,6 +88,18 @@ def is_canadian(text: str, meta: SecurityInfo) -> bool:
     # Fallback: title indicates Canadian domicile (still much safer than scanning full text)
     return any(k in title for k in CANADA_TITLE_KEYWORDS)
 
+NON_COMMON_SUFFIXES = ("W", "WS", "WT", "RT")
+
+def is_non_common_security(meta: SecurityInfo) -> bool:
+    t = (meta.ticker or "").upper()
+    if not t:
+        return True
+    if t.endswith(NON_COMMON_SUFFIXES):
+        return True
+    if "^" in t or "/" in t or "-" in t:
+        return True
+    return False
+
 
 def passes_security_filters(text: str, meta: SecurityInfo) -> bool:
     return not (is_adr(text, meta) or is_etf(text, meta) or is_canadian(text, meta))
@@ -84,7 +107,7 @@ def passes_security_filters(text: str, meta: SecurityInfo) -> bool:
 
 def passes_rounding_policy(policy: str) -> bool:
     # Keep UNKNOWN allowed during tuning; tighten later if you want ROUND_UP only
-    return policy in (ROUND_UP, UNKNOWN)
+    return policy in (ROUND_UP)
 
 
 def passes_price_threshold(price: Optional[float], ratio_new: Optional[int], ratio_old: Optional[int]) -> bool:
@@ -112,5 +135,8 @@ def summarize_rejection(
     if price is not None:
         if not passes_price_threshold(price, ratio_new, ratio_old):
             return "Fails price * ratio threshold"
+    
+    if is_non_common_security(meta):
+        return "Excluded non-common security (warrant/rights/unit/preferred)"
 
     return None
