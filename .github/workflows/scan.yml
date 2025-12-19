@@ -2,13 +2,16 @@ name: Reverse split scan
 
 on:
   schedule:
-    - cron: '0 13 * * 1-5'
-    - cron: '0 17 * * 1-5'
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      ALERT_SENDER_EMAIL: ${{ secrets.ALERT_SENDER_EMAIL }}
+      ALERT_SENDER_APP_PWD: ${{ secrets.ALERT_SENDER_APP_PWD }}
+      ALERT_RECIPIENTS: ${{ secrets.ALERT_RECIPIENTS }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -18,11 +21,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run scanner
-        env:
-          ALERT_SENDER_EMAIL: ${{ secrets.ALERT_SENDER_EMAIL }}
-          ALERT_SENDER_APP_PWD: ${{ secrets.ALERT_SENDER_APP_PWD }}
-          ALERT_RECIPIENTS: ${{ secrets.ALERT_RECIPIENTS }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
         run: |
           python run.py
       - name: Upload results

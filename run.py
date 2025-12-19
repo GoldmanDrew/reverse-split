@@ -291,6 +291,5 @@ def maybe_email(results: List[dict]) -> None:
 if __name__ == "__main__":
     runner = Runner()
     results = runner.run()
-
     maybe_email(results)
     print(f"Wrote {len(results)} results to {RESULTS_JSON}")
