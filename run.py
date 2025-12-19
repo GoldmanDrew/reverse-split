@@ -17,15 +17,13 @@ SEEN_ACCESSIONS = DATA_DIR / "seen_accessions.json"
 TICKER_MAP_PATH = DATA_DIR / "ticker_map.json"
 PRICE_CACHE_PATH = Path("price_cache.json")
 
-WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "72"))
-WINDOW_HOURS = 388
+WINDOW_HOURS = 72
 
-USER_AGENT = os.environ.get("SEC_USER_AGENT", edgar.USER_AGENT)
+USER_AGENT = edgar.USER_AGENT
 
-# If set to "1", ignore seen_accessions.json and reprocess filings in-window.
-FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS", "0") == "1"
-FORCE_REPROCESS = 1
+FORCE_REPROCESS = 0
 
+LIMIT_PER_CIK = 5
 
 def today_et():
     return datetime.now(ZoneInfo("America/New_York")).date()
@@ -69,9 +67,9 @@ class Runner:
             self.session,
             USER_AGENT,
             data_dir=DATA_DIR,
-            batch_size= 999999,#int(os.environ.get("CIK_BATCH_SIZE", "1200")),
-            limit_per_cik=int(os.environ.get("LIMIT_PER_CIK", "25")),
-            window_days_floor=8,
+            batch_size= 999999,
+            limit_per_cik=int(LIMIT_PER_CIK),
+            window_days_floor=2,
             debug=True,
         )
 
@@ -124,20 +122,11 @@ class Runner:
             exchange = exchange_map  # working var
             title = meta.get("title", filing.company)
 
-            # -----------------------------
-            # Ticker decision (robust)
-            # Priority:
-            #   1) Parse 8-K trading symbol table if present
-            #   2) If SEC-mapped ticker is non-common, derive a common ticker (e.g., BENFW -> BENF)
-            #   3) Fall back to SEC mapping
-            # -----------------------------
-            ticker_source = "sec_map"
             ticker = ticker_map
 
             tkr2, exch2 = parse.extract_common_ticker_exchange(text)
             if tkr2:
                 ticker = tkr2
-                ticker_source = "8k_trading_table"
                 # FIX: normalize exchange even if exch2 is missing
                 exchange = (exch2 or exchange_map).upper().strip()
             else:
@@ -146,29 +135,7 @@ class Runner:
                     derived = derive_common_ticker_from_map(ticker_map)
                     if derived:
                         ticker = derived
-                        ticker_source = "derived_from_map"
-                        # FIX: reset exchange based on SEC mapping (don’t carry stale state)
                         exchange = exchange_map
-
-                        # Optional safety check (slower): only accept derived if it has a price
-                        # px_check = price.fetch_price_with_fallback(derived, self.price_cache, self.session)
-                        # if px_check is None:
-                        #     ticker = ticker_map
-                        #     ticker_source = "sec_map"
-                        #     exchange = exchange_map
-
-            if filing.cik == BENF_CIK:
-                print(
-                    "BENF TICKER DECISION:",
-                    {
-                        "ticker_map": ticker_map,
-                        "final_ticker": ticker,
-                        "exchange": exchange,
-                        "source": ticker_source,
-                        "parsed_ticker": tkr2,
-                        "parsed_exchange": exch2,
-                    },
-                )
 
             sec_info = filters.SecurityInfo(ticker=ticker, exchange=exchange, title=title)
 
@@ -183,10 +150,15 @@ class Runner:
 
             today = datetime.now(ZoneInfo("America/New_York")).date()
 
-            if extraction.effective_date.date() < today:
+            if extraction.effective_date is not None and extraction.effective_date.date() < today:
                 counts["rejected_by_policy"] += 1
                 print(f"Effective date already passed ({extraction.effective_date.date().isoformat()})")
                 continue
+
+            # Build an SEC filing index URL (works even if the Filing object doesn't store a URL)
+            acc_no_dashes = filing.accession.replace("-", "")
+            default_url = f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/{acc_no_dashes}/{filing.accession}-index.html"
+            filing_url = getattr(filing, "url", None) or getattr(filing, "link", None) or default_url
 
             record = {
                 "accession": filing.accession,
@@ -196,12 +168,9 @@ class Runner:
                 "exchange": exchange,
                 "form": filing.form,
                 "filed_at": filing.filed_at.isoformat(),
-                "effective_date": extraction.effective_date.isoformat()
-                if extraction.effective_date
-                else None,
-                "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}"
-                if extraction.ratio_new
-                else None,
+                "filing_url": filing_url,   # <-- NEW
+                "effective_date": extraction.effective_date.isoformat() if extraction.effective_date else None,
+                "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}",
                 "ratio_new": extraction.ratio_new,
                 "ratio_old": extraction.ratio_old,
                 "rounding_policy": extraction.rounding_policy,
@@ -209,6 +178,7 @@ class Runner:
                 "potential_profit": None,
                 "rejection_reason": rejection,
             }
+
             
             if rejection is None:
                 results.append(record)
@@ -224,14 +194,35 @@ class Runner:
 
         def dedupe_events(records: list[dict]) -> list[dict]:
             best = {}
+
             for r in records:
-                eff = (r.get("effective_date") or "").split("T")[0]
-                key = (r.get("ticker"), eff, r.get("ratio_new"), r.get("ratio_old"), r.get("rounding_policy"))
-                # keep latest filed_at
+                key = (
+                    r.get("ticker"),
+                    r.get("ratio_new"),
+                    r.get("ratio_old"),
+                    r.get("rounding_policy"),
+                )
+
                 cur = best.get(key)
-                if cur is None or (r.get("filed_at") or "") > (cur.get("filed_at") or ""):
+                if cur is None:
                     best[key] = r
+                    continue
+
+                # Prefer a record that has an effective_date
+                r_eff = r.get("effective_date")
+                c_eff = cur.get("effective_date")
+                if (not c_eff) and r_eff:
+                    best[key] = r
+                    continue
+                if c_eff and (not r_eff):
+                    continue
+
+                # Otherwise keep latest filed_at
+                if (r.get("filed_at") or "") > (cur.get("filed_at") or ""):
+                    best[key] = r
+
             return list(best.values())
+
 
         results = dedupe_events(results)
 

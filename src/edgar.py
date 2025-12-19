@@ -601,7 +601,7 @@ def fetch_recent_filings_via_submissions_universe(
     data_dir: Path = Path("data"),
     batch_size: int = 999999,
     limit_per_cik: int = 25,
-    window_days_floor: int = 14,
+    window_days_floor: int = 2,
     debug: bool = True,
 ) -> List[Filing]:
     """

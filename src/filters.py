@@ -13,12 +13,6 @@ class SecurityInfo:
     country: Optional[str] = None
 
 
-# NOTE:
-# - Do NOT use broad keywords like "trust" against the full filing text.
-#   "trust" shows up constantly (transfer agents, indenture trustees, stock transfer & trust companies)
-#   and will create huge false exclusions (e.g., Beneficient).
-ADR_KEYWORDS = ["adr", "american depositary", "american depository"]
-
 # Keep ETF detection tight and focused
 ETF_TEXT_KEYWORDS = [
     "exchange-traded fund",
@@ -32,21 +26,56 @@ ETF_TEXT_KEYWORDS = [
 
 # Canada detection should primarily use metadata (exchange / country), not random text mentions.
 CANADA_EXCHANGES = {"TSX", "TSXV", "CSE", "NEO", "CNQ"}  # common Canadian venues
-CANADA_TITLE_KEYWORDS = ["canada", "ontario", "british columbia", "alberta", "quebec"]
-
+CANADA_TITLE_EXPLICIT = [
+    " inc. (canada)", # very explicit
+    " corp. (canada)",
+]
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
+import re
+
+# Strong, explicit ADR indicators (use regex with word boundaries)
+_ADR_TITLE_RE = re.compile(
+    r"\b(adr|ads)\b|american depositary|american depository|depositary (receipt|share)",
+    re.I
+)
+
+# If you want a second-tier check, only look in the SEC header / document header area,
+# not the entire filing body.
+_HDR_SLICE_CHARS = 12000  # enough to capture <SEC-HEADER> and early cover page
+
 def is_adr(text: str, meta: SecurityInfo) -> bool:
-    t = _norm(text)
+    """
+    Return True only with strong evidence of ADR/ADS.
+
+    Changes vs old:
+      - Uses regex with WORD BOUNDARIES for 'ADR'/'ADS' (prevents substring matches).
+      - Prefers title and header; avoids scanning entire filing body.
+      - Defaults to False if uncertain.
+    """
     title = _norm(meta.title)
-    # ADRs are usually clearly labeled; title signal is stronger than full-text
-    if any(k in title for k in ADR_KEYWORDS):
+
+    # 1) Title is the best signal (often literally includes 'ADR' / 'ADS')
+    if title and _ADR_TITLE_RE.search(title):
         return True
-    # Text can still be useful, but keep it simple
-    return any(k in t for k in ADR_KEYWORDS)
+
+    # 2) Header/cover-page only (NOT full text)
+    #    Many false positives come from random body text; avoid that entirely.
+    head = _norm((text or "")[:_HDR_SLICE_CHARS])
+    if head and _ADR_TITLE_RE.search(head):
+        # To reduce false positives further, require at least one strong phrase,
+        # or ADR/ADS as standalone token near "depositary"
+        hl = head.lower()
+        if ("american depositary" in hl) or ("american depository" in hl) or ("depositary receipt" in hl) or ("depositary share" in hl):
+            return True
+
+        # If it is only 'adr'/'ads' without any depositary wording, treat as NOT ADR
+        return False
+
+    return False
 
 
 def is_etf(text: str, meta: SecurityInfo) -> bool:
@@ -73,21 +102,33 @@ def is_etf(text: str, meta: SecurityInfo) -> bool:
     # require either a strong signal, or 2+ weak signals
     return strong or weak >= 2
 
-
 def is_canadian(text: str, meta: SecurityInfo) -> bool:
+    """
+    Returns True ONLY when there is strong, explicit evidence the issuer is Canadian.
+    Missing or ambiguous data defaults to False.
+    """
+
     exch = (meta.exchange or "").strip().upper()
     country = (meta.country or "").strip().upper()
     title = _norm(meta.title)
 
-    # Prefer metadata; do not exclude just because a filing text mentions TSX/Canada in passing.
+    # 1) Strongest signal: explicit country metadata
     if country in {"CA", "CAN", "CANADA"}:
         return True
+
+    # 2) Strong signal: Canadian exchange
     if exch in CANADA_EXCHANGES:
         return True
 
-    # Fallback: title indicates Canadian domicile (still much safer than scanning full text)
-    return any(k in title for k in CANADA_TITLE_KEYWORDS)
+    # 3) Extremely conservative fallback: explicit issuer naming
+    #    (Optional — you can delete this block entirely if you want zero risk)
+    if title:
+        for pat in CANADA_TITLE_EXPLICIT:
+            if pat in title:
+                return True
 
+    # Default: NOT Canadian
+    return False
 NON_COMMON_SUFFIXES = ("W", "WS", "WT", "RT")
 
 def is_non_common_security(meta: SecurityInfo) -> bool:
