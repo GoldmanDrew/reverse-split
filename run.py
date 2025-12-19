@@ -247,7 +247,7 @@ class Runner:
 
             potential = None
             if px is not None and ratio_new and ratio_old:
-                potential = round(px * (ratio_old / ratio_new), 4)
+                potential = round(px * (ratio_old / ratio_new) - px, 4)
             record["potential_profit"] = potential
 
         self.price_cache.save()
