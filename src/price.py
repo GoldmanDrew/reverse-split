@@ -2,7 +2,7 @@ import csv
 import json
 from datetime import date
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -108,3 +108,33 @@ def fetch_price_with_fallback(
         return stooq_px
 
     return fetch_close_price(ticker, cache)
+
+
+def fetch_recent_closes(
+    ticker: str, days: int = 5, session: Optional[requests.Session] = None
+) -> List[float]:
+    """
+    Return up to ``days`` most recent close prices (newest last).
+
+    Uses Yahoo Finance for a small lookback window to detect sustained moves
+    above $1.00 / $1.15 when evaluating reverse-split risk trades.
+    """
+
+    if not ticker:
+        return []
+
+    try:
+        data = yf.Ticker(ticker).history(period=f"{max(days, 1)}d")
+    except Exception:
+        return []
+
+    if data.empty:
+        return []
+
+    closes: List[float] = []
+    for px in data["Close"].tail(days):
+        try:
+            closes.append(float(px))
+        except (TypeError, ValueError):
+            continue
+    return closes

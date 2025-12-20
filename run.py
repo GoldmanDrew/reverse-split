@@ -25,6 +25,14 @@ FORCE_REPROCESS = 0
 
 LIMIT_PER_CIK = 5
 
+
+# --- Optional trading settings (can be overridden by env vars) ---
+ENABLE_TRADING = os.environ.get("ENABLE_IBKR_TRADING") == "1"
+TOTAL_NOTIONAL = float(os.environ.get("IBKR_TOTAL_NOTIONAL", "0"))
+MAX_BORROW_RATE = float(os.environ.get("MAX_BORROW_RATE", "0.25"))
+COMPLIANCE_PRICE = float(os.environ.get("COMPLIANCE_PRICE", "1.15"))
+COMPLIANCE_DAYS = int(os.environ.get("COMPLIANCE_DAYS", "2"))
+
 def today_et():
     return datetime.now(ZoneInfo("America/New_York")).date()
 
@@ -288,8 +296,45 @@ def maybe_email(results: List[dict]) -> None:
         alert.send_email(results, sender, pwd, recipients)
 
 
+def maybe_trade(results: List[dict]) -> None:
+    if not ENABLE_TRADING:
+        print("Trading disabled (set ENABLE_IBKR_TRADING=1 to activate).")
+        return
+
+    if TOTAL_NOTIONAL <= 0:
+        print("Trading notional is zero; set IBKR_TOTAL_NOTIONAL to enable orders.")
+        return
+
+    from src import ibkr_algo, trading
+
+    strategy = trading.ReverseSplitStrategy(
+        compliance_threshold=COMPLIANCE_PRICE,
+        consecutive_days=COMPLIANCE_DAYS,
+        max_borrow_rate=MAX_BORROW_RATE,
+    )
+
+    borrow_provider: trading.BorrowCostProvider | None = None
+    try:
+        borrow_provider = ibkr_algo.IBBorrowCostProvider.from_env()
+    except Exception as exc:  # pragma: no cover - connection errors are runtime
+        print(f"Unable to connect to IBKR for borrow lookup: {exc}")
+
+    candidates = strategy.select_candidates(results, borrow_provider)
+    if not candidates:
+        print("No trading candidates after applying compliance/borrow filters.")
+        return
+
+    try:
+        trader = ibkr_algo.IBKRAlgoTrader.from_env()
+        trader.execute_equal_weight_shorts(candidates, TOTAL_NOTIONAL)
+        print(f"Placed orders for {len(candidates)} candidates")
+    except Exception as exc:  # pragma: no cover - runtime connectivity issues
+        print(f"Unable to place IBKR orders: {exc}")
+
+
 if __name__ == "__main__":
     runner = Runner()
     results = runner.run()
     maybe_email(results)
+    maybe_trade(results)
     print(f"Wrote {len(results)} results to {RESULTS_JSON}")
