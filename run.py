@@ -179,7 +179,6 @@ class Runner:
                 "rejection_reason": rejection,
             }
 
-            
             if rejection is None:
                 results.append(record)
                 counts["accepted"] += 1
@@ -287,8 +286,97 @@ def maybe_email(results: List[dict]) -> None:
         recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
         alert.send_email(results, sender, pwd, recipients)
 
+import re
+import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def _fetch_sec_index_and_find_primary_txt(index_url: str, session: requests.Session) -> str:
+    """
+    Given an SEC '-index.html' page, find the primary filing .txt URL.
+    This avoids quotemedia/3rd party HTML quirks and uses SEC source of truth.
+    """
+    r = session.get(index_url, timeout=30)
+    r.raise_for_status()
+    html = r.text
+
+    # Common pattern in SEC index pages: a link to the complete submission text file ending in .txt
+    # Example: /Archives/edgar/data/.../000xxxxxxx-xx-xxxxxx.txt
+    m = re.search(r'href="([^"]+\.txt)"', html, flags=re.IGNORECASE)
+    if not m:
+        # fallback: sometimes the .txt is in a different attribute formatting
+        m = re.search(r'(/Archives/edgar/data/[^"\s]+\.txt)', html, flags=re.IGNORECASE)
+    if not m:
+        raise RuntimeError("Could not find primary .txt filing link on index page")
+
+    href = m.group(1)
+    if href.startswith("/"):
+        return "https://www.sec.gov" + href
+    if href.startswith("https://"):
+        return href
+    # If relative without leading slash (rare)
+    return "https://www.sec.gov/" + href.lstrip("/")
+
+
+def debug_two_filings(index_urls: list[str]) -> None:
+    """
+    Fetch each SEC index page, resolve the primary .txt filing, and run parse/extract on it.
+    Prints the extracted fields and context around key phrases.
+    """
+    runner = Runner()
+    print("\n========== DEBUG TWO FILINGS ==========")
+    for idx_url in index_urls:
+        print("\n--------------------------------------")
+        print("INDEX:", idx_url)
+
+        txt_url = _fetch_sec_index_and_find_primary_txt(idx_url, runner.session)
+        print("PRIMARY TXT:", txt_url)
+
+        resp = runner.session.get(txt_url, timeout=30)
+        resp.raise_for_status()
+        text = resp.text
+
+        print("TXT length:", len(text))
+
+        # Core detection
+        print("contains_reverse_split_language:", parse.contains_reverse_split_language(text))
+        print("is_delisting_notice_only:", parse.is_delisting_notice_only(text))
+
+        # Extraction
+        filed_at_guess = datetime.now(ZoneInfo("America/New_York"))
+        extraction = parse.extract_details(text, filed_at=filed_at_guess)
+
+        print("\n[EXTRACTED]")
+        print("  ratio_new:", extraction.ratio_new)
+        print("  ratio_old:", extraction.ratio_old)
+        print("  ratio_display:", f"{extraction.ratio_new}-for-{extraction.ratio_old}")
+        print("  effective_date:", extraction.effective_date)
+        print("  rounding_policy:", extraction.rounding_policy)
+
+        # Context helpers (so you can see why a regex hit/missed)
+        def show_context(pattern: str, label: str, window: int = 220):
+            m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                print(f"\n[CTX] {label}: NOT FOUND  | pattern={pattern}")
+                return
+            s, e = m.start(), m.end()
+            lo = max(0, s - window)
+            hi = min(len(text), e + window)
+            snippet = text[lo:hi]
+            print(f"\n[CTX] {label}: FOUND")
+            print(snippet)
+
+        # Show likely sources of errors
+        show_context(r"\b\d{1,3}(?:,\d{3})*\s*[-–]\s*for\s*[-–]\s*\d{1,3}(?:,\d{3})*\b", "hyphenated ratio X-for-Y")
+        show_context(r"between\s+one[-\s]*for[-\s]*two.*one[-\s]*for[-\s]*ten", "ratio RANGE language (authorization)")
+        show_context(r"implemented\s+effective|will\s+be\s+effective|effective\s+date|market\s+effective\s+date|begin\s+trading\s+on\s+a\s+split-adjusted\s+basis", "effective-date language")
+        show_context(r"fractional\s+share|no\s+fractional\s+shares|rounded\s+up|cash\s+in\s+lieu|paid\s+in\s+cash", "fractional/rounding language")
+
+
 
 if __name__ == "__main__":
+    # --- Single filing debug (CODX 8-K) ---
+
     runner = Runner()
     results = runner.run()
     maybe_email(results)

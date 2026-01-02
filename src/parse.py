@@ -26,6 +26,12 @@ RATIO_PAREN_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+RATIO_RE = re.compile(
+    r"\b(\d{1,3}(?:,\d{3})*)\s*[-–]\s*for\s*[-–]\s*(\d{1,3}(?:,\d{3})*)\b",
+    re.IGNORECASE
+)
+
+
 NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -57,19 +63,21 @@ import re
 from typing import Optional, Tuple
 
 # --- Patterns (broad but guarded by scoring) ---
+NUM_COMMA = r"\d{1,3}(?:,\d{3})*|\d+"
 
+
+# RATIO_FOR_PATTERN = re.compile(
+#     r"(?P<new>\d{1,5})\s*(?:-?\s*for\s*-?)\s*(?P<old>\d{1,5})",
+#     re.IGNORECASE,
+# )
 RATIO_FOR_PATTERN = re.compile(
-    r"(?P<new>\d{1,5})\s*(?:-?\s*for\s*-?)\s*(?P<old>\d{1,5})",
-    re.IGNORECASE,
+    rf"\b(?P<new>{NUM_COMMA})\s*[-–]\s*for\s*[-–]\s*(?P<old>{NUM_COMMA})\b",
+    re.IGNORECASE
 )
+
 
 RATIO_COLON_PATTERN = re.compile(
     r"(?P<new>\d{1,5})\s*:\s*(?P<old>\d{1,5})",
-    re.IGNORECASE,
-)
-
-RATIO_TO_PATTERN = re.compile(
-    r"(?P<new>\d{1,5})\s*(?:-?\s*to\s*-?)\s*(?P<old>\d{1,5})",
     re.IGNORECASE,
 )
 
@@ -136,6 +144,14 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
 
     t = _norm_text_html(text)
     tl = t.lower()
+        # Guardrail: authorization/range language (not a finalized split)
+    if ("ratio of between" in tl or "within a range" in tl or "to be determined by our board" in tl) and \
+       ("one-for-two" in tl and "one-for-ten" in tl) and \
+       ("exact ratio" in tl or "to be determined" in tl or "in its discretion" in tl):
+        # If there's no definitive numeric hyphenated X-for-Y, don't guess.
+        if not re.search(r"\b\d{1,3}(?:,\d{3})*\s*-\s*for\s*-\s*\d{1,3}(?:,\d{3})*\b", tl):
+            return None, None
+
 
     # Anchor locations for scoring (prefer ratios near reverse split discussion)
     anchors = []
@@ -147,6 +163,8 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
 
     def score_candidate(start: int, end: int, new: int, old: int) -> int:
         if new <= 0 or old <= 0:
+            return 10**9
+        if new >= old:  # <-- CHANGE: was only new > old
             return 10**9
         if new > old:
             return 10**9
@@ -174,47 +192,66 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
             bonus += 300
 
         # Light heuristic preference for common reverse split ratios
-        if new == 1 and old in {2,3,4,5,8,10,12,15,20,25,30,40,50,60,75,80,100,200,250,500,1000}:
+        if new == 1 and old >= 2:
             bonus -= 25
+
+        if new == 1 and old in {2,3,4,5,8,10,12,15,20,25,30,40,50,60,75,80,100,200,250,500,1000}:
+            bonus -= 100
 
         return dist + bonus
 
     candidates = []
 
+    def _to_int(x: str) -> int:
+        return int(x.replace(",", "").strip())
+    
+    MONTH_WORDS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec")
+
+    def looks_like_date_nearby(start: int, end: int) -> bool:
+        w = tl[max(0, start - 40): min(len(tl), end + 40)]
+        # “Dec. 29, 2025” patterns often have a month word + a comma + a 4-digit year nearby
+        if any(mo in w for mo in MONTH_WORDS) and re.search(r"\b(19|20)\d{2}\b", w) and "," in w:
+            return True
+        # Also guard "date of report"
+        if "date of report" in w or "dated" in w:
+            return True
+        return False
+
+
     # Numeric X-for-Y
     for m in RATIO_FOR_PATTERN.finditer(t):
-        new = int(m.group("new"))
-        old = int(m.group("old"))
+        new = _to_int(m.group("new"))
+        old = _to_int(m.group("old"))
+
         window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if not looks_like_date_nearby(m.start(), m.end()):
+            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
 
     # Colon X:Y
     for m in RATIO_COLON_PATTERN.finditer(t):
-        new = int(m.group("new"))
-        old = int(m.group("old"))
+        new = _to_int(m.group("new"))
+        old = _to_int(m.group("old"))
         window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
-
-    # X to Y (rare)
-    for m in RATIO_TO_PATTERN.finditer(t):
-        new = int(m.group("new"))
-        old = int(m.group("old"))
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if not looks_like_date_nearby(m.start(), m.end()):
+            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
 
     # Prose: each/every ... (N) shares ... into (1) share
+        # Prose: each/every ... (N) shares ... into (M) shares
     for m in PROSE_EVERY_PATTERN.finditer(t):
-        old = int(m.group("old_num"))
-        new = int(m.group("new_num"))
+        old = _to_int(m.group("old_num"))
+        new = _to_int(m.group("new_num"))
         window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if not looks_like_date_nearby(m.start(), m.end()):
+            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
 
     # Prose alternate: (N) shares ... into (1) share
+        # Prose alternate: (N) shares ... into (M) shares
     for m in PROSE_INTO_PATTERN.finditer(t):
-        old = int(m.group("old_num"))
-        new = int(m.group("new_num"))
+        old = _to_int(m.group("old_num"))
+        new = _to_int(m.group("new_num"))
         window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if not looks_like_date_nearby(m.start(), m.end()):
+            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
 
     if not candidates:
         return None, None
@@ -461,10 +498,162 @@ def _score_date_context(ctx: str) -> int:
 
     return score
 
+IMPLEMENTED_EFFECTIVE_RE = re.compile(
+    r"\bimplemented\s+effective\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
+    re.IGNORECASE
+)
+
 
 from datetime import datetime, timedelta
 from typing import Optional
 
+
+# def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
+#     """
+#     Extract the reverse-split MARKET effective / trading date.
+
+#     Key rules:
+#       - Bucket candidates into MARKET vs NON-MARKET; if any MARKET candidates exist, only pick among them.
+#       - Prefer dates on/after filing date (with a small negative buffer), but do NOT hard-require it
+#         because some 8-Ks are filed after the split is already effective.
+#       - If only non-market candidates exist and they look like approval/Delaware/charter dates,
+#         return None (avoid false positives).
+#     """
+#     if not text:
+#         return None
+
+#     t = _norm_text_html(text)
+
+#     # 0) explicit Effective Time definition (highest precision)
+#     m = EFFECTIVE_TIME_DEF_PATTERN.search(t)
+#     if m:
+#         try:
+#             return dtparser.parse(m.group("date"), fuzzy=True)
+#         except Exception:
+#             pass
+
+#     market_candidates: list[tuple[int, datetime, str]] = []
+#     other_candidates: list[tuple[int, datetime, str]] = []
+
+#     def _is_charter_ctx(cl: str) -> bool:
+#         return (
+#             "certificate of amendment" in cl
+#             or "secretary of state" in cl
+#             or "state of delaware" in cl
+#         )
+
+#     def _is_market_ctx(cl: str) -> bool:
+#         if _is_charter_ctx(cl):
+#             # only count as market if it explicitly references trading behavior
+#             return (
+#                 "reflected in the trading" in cl
+#                 or "split-adjusted" in cl
+#                 or "begin trading" in cl
+#                 or "commence trading" in cl
+#                 or "trade on a split-adjusted basis" in cl
+#                 or "market open" in cl
+#             )
+
+#         # non-charter windows can treat these as market signals
+#         return (
+#             "reflected in the trading" in cl
+#             or "split-adjusted" in cl
+#             or "begin trading" in cl
+#             or "commence trading" in cl
+#             or "trade on a split-adjusted basis" in cl
+#             or "market open" in cl
+#             or "effective time" in cl
+#             or "will become effective" in cl
+#             or "become effective" in cl
+#         )
+
+
+
+#     # 1) Trigger-based candidates
+#     trig_cands = _find_dates_near_triggers(t, filed_at=filed_at)
+
+#     for item in trig_cands:
+#         # Support both (score, dt, ctx) and (score, dt, ctx, kind)
+#         if len(item) == 4:
+#             score, dt, ctx, kind = item
+#         else:
+#             score, dt, ctx = item
+#             kind = "market" if _is_market_ctx(ctx.lower()) else "non_market"
+
+#         if kind == "market":
+#             market_candidates.append((score, dt, ctx))
+#         else:
+#             other_candidates.append((score, dt, ctx))
+
+#     # 2) Pattern-based candidates
+#     for pat in DATE_CANDIDATE_PATTERNS:
+#         for m in pat.finditer(t):
+#             raw = m.group("date")
+#             try:
+#                 dt = dtparser.parse(raw, fuzzy=True)
+#             except Exception:
+#                 continue
+
+#             start = max(0, m.start() - 260)
+#             end = min(len(t), m.end() + 260)
+#             ctx = t[start:end]
+#             score = _score_date_context(ctx)
+
+#             # filed_at sanity (light)
+#             if filed_at is not None:
+#                 days_diff = (dt.date() - filed_at.date()).days
+#                 if days_diff < -2:
+#                     score += 1200
+#                 elif days_diff < 0:
+#                     score += 500
+
+#             if _is_market_ctx(ctx.lower()):
+#                 market_candidates.append((score, dt, ctx))
+#             else:
+#                 other_candidates.append((score, dt, ctx))
+
+#     # Helper: choose best candidate but prefer on/after filing (with buffer)
+#     def _choose_best(cands: list[tuple[int, datetime, str]]) -> datetime:
+#         cands_sorted = sorted(cands, key=lambda x: (x[0], -x[1].timestamp()))
+
+#         if filed_at is None:
+#             return cands_sorted[0][1]
+
+#         # Prefer dates on/after (filed_at - buffer)
+#         # Buffer allows timezone quirks / "filed late, effective early next morning" cases.
+#         threshold = (filed_at - timedelta(days=1)).date()
+
+#         for score, dt, ctx in cands_sorted:
+#             if dt.date() >= threshold:
+#                 return dt
+
+#         # If none meet threshold, keep best overall (split may have already happened)
+#         return cands_sorted[0][1]
+
+#     # 3) Selection rule:
+#     # If we have any MARKET candidates, pick from those ONLY.
+#     if market_candidates:
+#         return _choose_best(market_candidates)
+
+#     # Otherwise fall back to NON-MARKET candidates with guardrails
+#     if not other_candidates:
+#         return None
+
+#     best_dt = _choose_best(other_candidates)
+
+#     # Guardrail: if best non-market looks like Delaware/approval and we saw no market language anywhere, return None
+#     # (Prevents PRPH-style Dec 2 false positives when Dec 22 isn't present in the extracted text)
+#     # Note: This is conservative; if you prefer always returning *some* date, remove this block.
+#     best_ctx = min(other_candidates, key=lambda x: (x[0], -x[1].timestamp()))[2]
+#     lower = best_ctx.lower()
+
+#     looks_non_market = any(rx.search(lower) for rx in NON_EFFECTIVE_NEGATIVES)
+#     saw_market_anywhere = any(trig.search(t.lower()) for trig, _ in EFFECTIVE_TRIGGERS)
+
+#     if looks_non_market and not saw_market_anywhere:
+#         return None
+
+#     return best_dt
 def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
     """
     Extract the reverse-split MARKET effective / trading date.
@@ -501,7 +690,6 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
 
     def _is_market_ctx(cl: str) -> bool:
         if _is_charter_ctx(cl):
-            # only count as market if it explicitly references trading behavior
             return (
                 "reflected in the trading" in cl
                 or "split-adjusted" in cl
@@ -511,7 +699,6 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
                 or "market open" in cl
             )
 
-        # non-charter windows can treat these as market signals
         return (
             "reflected in the trading" in cl
             or "split-adjusted" in cl
@@ -522,15 +709,31 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
             or "effective time" in cl
             or "will become effective" in cl
             or "become effective" in cl
+            or "implemented effective" in cl  # NEW
+            or "market effective date" in cl   # NEW
         )
 
+    # --- NEW: direct “implemented effective <date>” candidates (treat as MARKET) ---
+    IMPLEMENTED_EFFECTIVE_PATTERNS = [
+        re.compile(r"\bimplemented\s+effective\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
+        re.compile(r"\bimplemented\s+on\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
+        re.compile(r"\bmarket\s+effective\s+date\b.*?(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE | re.DOTALL),
+    ]
+    for pat in IMPLEMENTED_EFFECTIVE_PATTERNS:
+        for m in pat.finditer(t):
+            raw = m.group("date")
+            try:
+                dt = dtparser.parse(raw, fuzzy=True)
+            except Exception:
+                continue
 
+            # give it a very good score; it is explicitly "effective"
+            market_candidates.append((-2000, dt, t[max(0, m.start()-120): min(len(t), m.end()+120)]))
 
     # 1) Trigger-based candidates
     trig_cands = _find_dates_near_triggers(t, filed_at=filed_at)
 
     for item in trig_cands:
-        # Support both (score, dt, ctx) and (score, dt, ctx, kind)
         if len(item) == 4:
             score, dt, ctx, kind = item
         else:
@@ -569,38 +772,29 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
             else:
                 other_candidates.append((score, dt, ctx))
 
-    # Helper: choose best candidate but prefer on/after filing (with buffer)
     def _choose_best(cands: list[tuple[int, datetime, str]]) -> datetime:
         cands_sorted = sorted(cands, key=lambda x: (x[0], -x[1].timestamp()))
 
         if filed_at is None:
             return cands_sorted[0][1]
 
-        # Prefer dates on/after (filed_at - buffer)
-        # Buffer allows timezone quirks / "filed late, effective early next morning" cases.
         threshold = (filed_at - timedelta(days=1)).date()
 
         for score, dt, ctx in cands_sorted:
             if dt.date() >= threshold:
                 return dt
 
-        # If none meet threshold, keep best overall (split may have already happened)
         return cands_sorted[0][1]
 
     # 3) Selection rule:
-    # If we have any MARKET candidates, pick from those ONLY.
     if market_candidates:
         return _choose_best(market_candidates)
 
-    # Otherwise fall back to NON-MARKET candidates with guardrails
     if not other_candidates:
         return None
 
     best_dt = _choose_best(other_candidates)
 
-    # Guardrail: if best non-market looks like Delaware/approval and we saw no market language anywhere, return None
-    # (Prevents PRPH-style Dec 2 false positives when Dec 22 isn't present in the extracted text)
-    # Note: This is conservative; if you prefer always returning *some* date, remove this block.
     best_ctx = min(other_candidates, key=lambda x: (x[0], -x[1].timestamp()))[2]
     lower = best_ctx.lower()
 
@@ -717,33 +911,98 @@ def _contains_words(text: str, words) -> bool:
     return any(word in text_lower for word in words)
 
 def classify_rounding_policy(text: str) -> str:
-    t = " ".join(text.lower().split())
+    t = " ".join((text or "").lower().split())
 
-    # Strong ROUND_UP (Beneficient-style)
-    if (
-        "additional share" in t
-        and "fractional share" in t
-        and "cash" not in t
-    ):
+    # ----------------------------
+    # 1) ROUND_UP (maximize recall)
+    # ----------------------------
+    # If the document is presenting alternatives, do NOT classify as round-up.
+    # Example: "... pay in cash ... OR ... rounded up ..."
+    if ("pay in cash" in t or "cash" in t) and "rounded up" in t and " or " in t:
+        return UNKNOWN
+
+
+    # A) "rounded up" family (covers CODX: "rounded up to the next whole number")
+    if "rounded up" in t and ("fractional" in t or "no fractional" in t):
+        # Many filings say "rounded up to the nearest/next whole share/number"
+        if ("whole share" in t) or ("whole number" in t) or ("nearest whole" in t) or ("next whole" in t):
+            return ROUND_UP
+        # Even if they don't say whole share/number explicitly, "rounded up" + fractional is usually enough
         return ROUND_UP
 
+    # B) Exact common phrases (keep your existing one + broaden it)
     if "rounded up to the nearest whole share" in t:
         return ROUND_UP
-    
-    if ("additional share" in t and "in lieu" in t and "fractional" in t) or \
-    ("entitled to receive" in t and "additional" in t and "in lieu" in t and "fractional" in t):
+    if "rounded up to the nearest whole number" in t:
         return ROUND_UP
-    
-    if "one whole share" in t and "fraction" in t and "in lieu" in t:
+    if "rounded up to the next whole share" in t:
+        return ROUND_UP
+    if "rounded up to the next whole number" in t:
         return ROUND_UP
 
-    # Cash-in-lieu
-    if "cash in lieu" in t or (
-        "receive cash" in t and "fractional" in t
-    ):
+    # C) "No fractional shares will be issued" + rounding wording
+    if ("no fractional shares" in t or "no fractional share" in t) and ("round" in t and "up" in t):
+        return ROUND_UP
+
+    # D) "one (1) whole share" / "additional share" in lieu of fractional
+    # (broader than your current checks)
+    if ("one whole share" in t or "one (1) whole share" in t) and ("fractional" in t or "fraction" in t) and ("in lieu" in t):
+        return ROUND_UP
+
+    if ("additional share" in t) and ("fractional" in t or "fraction" in t) and ("in lieu" in t):
+        return ROUND_UP
+
+    if ("entitled to receive" in t) and ("additional" in t) and ("in lieu" in t) and ("fractional" in t or "fraction" in t):
+        return ROUND_UP
+
+    # E) Another very common legal phrasing:
+    # "any holder otherwise entitled to a fractional share shall receive one whole share"
+    if ("otherwise entitled" in t) and ("fractional" in t) and ("shall receive" in t) and ("whole share" in t):
+        return ROUND_UP
+
+    # ----------------------------
+    # 2) CASH IN LIEU (more specific)
+    # ----------------------------
+    # We only classify cash-in-lieu when cash is clearly tied to fractional shares.
+    if "cash in lieu" in t and ("fractional" in t or "fraction" in t):
+        return CASH_IN_LIEU
+
+    if ("paid in cash" in t or "receive cash" in t) and ("fractional" in t or "fraction" in t):
+        return CASH_IN_LIEU
+
+    if ("cash payment" in t or "cash payments" in t) and ("fractional" in t or "fraction" in t):
         return CASH_IN_LIEU
 
     return UNKNOWN
+
+# def classify_rounding_policy(text: str) -> str:
+#     t = " ".join(text.lower().split())
+
+#     # Strong ROUND_UP (Beneficient-style)
+#     if (
+#         "additional share" in t
+#         and "fractional share" in t
+#         and "cash" not in t
+#     ):
+#         return ROUND_UP
+
+#     if "rounded up to the nearest whole share" in t:
+#         return ROUND_UP
+    
+#     if ("additional share" in t and "in lieu" in t and "fractional" in t) or \
+#     ("entitled to receive" in t and "additional" in t and "in lieu" in t and "fractional" in t):
+#         return ROUND_UP
+    
+#     if "one whole share" in t and "fraction" in t and "in lieu" in t:
+#         return ROUND_UP
+
+#     # Cash-in-lieu
+#     if "cash in lieu" in t or (
+#         "receive cash" in t and "fractional" in t
+#     ):
+#         return CASH_IN_LIEU
+
+#     return UNKNOWN
 
 from typing import Optional, Tuple
 
@@ -796,9 +1055,6 @@ def extract_common_ticker_exchange(text: str) -> Tuple[Optional[str], Optional[s
 import re
 from dateutil import parser as dtparser
 
-import re
-from dateutil import parser as dtparser
-
 # Month-name date, tolerate extra spaces and optional comma
 DATE_ANY = re.compile(r"(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})")
 
@@ -842,87 +1098,17 @@ _MARKET_PRIORITY = {
 
 _PLACEHOLDER_RE = re.compile(r"\[.*?trading date.*?\]|\[expected.*?\]|\[.*?\]", re.IGNORECASE)
 
-# def extract_effective_date_market_priority(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
-#     """
-#     Priority (market-first) effective date extractor.
-
-#     Behavior:
-#       - Searches ONLY for dates that appear after high-signal market/trading triggers
-#         (e.g., "reflected in the trading", "begin trading", "split-adjusted basis", etc.).
-#       - Chooses best by trigger priority, then prefers dates on/after filing (with small buffer),
-#         then latest date within that priority.
-#       - Never returns Delaware/charter/approval dates (those are handled by a separate fallback extractor).
-#       - Returns None if no market/trading-triggered date is found.
-
-#     Use in pipeline:
-#       effective = extract_effective_date_market_priority(full_text, filed_at)
-#       if effective is None:
-#           effective = extract_effective_date(full_text, filed_at)  # your broader fallback
-#     """
-#     if not text:
-#         return None
-
-#     t = _norm_text_html(text)
-#     tl = t.lower()
-
-#     candidates: List[Tuple[int, datetime, str]] = []  # (priority, dt, trigger_name)
-
-#     for name, trig in _MARKET_TRIGGERS:
-#         pr = _MARKET_PRIORITY.get(name, 99)
-#         for m in trig.finditer(tl):
-#             start = m.start()
-#             window = t[start : min(len(t), start + 1800)]
-
-#             # Skip placeholder blocks like "[expected first trading date]"
-#             if _PLACEHOLDER_RE.search(window):
-#                 # still allow if a real date exists in the window; we just don't want placeholders
-#                 pass
-
-#             dm = _DATE_ANY.search(window)
-#             if not dm:
-#                 continue
-
-#             raw = dm.group("date")
-#             try:
-#                 dt = dtparser.parse(raw, fuzzy=True)
-#             except Exception:
-#                 continue
-
-#             candidates.append((pr, dt, name))
-
-#     if not candidates:
-#         return None
-
-#     # Prefer on/after filing date (with a small buffer), but don't hard-require it
-#     threshold_date = None
-#     if filed_at is not None:
-#         threshold_date = (filed_at - timedelta(days=1)).date()
-
-#     def _rank(item: Tuple[int, datetime, str]) -> Tuple[int, int, float]:
-#         pr, dt, name = item
-#         meets = 0
-#         if threshold_date is not None and dt.date() >= threshold_date:
-#             meets = 1
-#         # Sort: priority asc, meets desc, dt desc
-#         return (pr, -meets, -dt.timestamp())
-
-#     candidates.sort(key=_rank)
-#     return candidates[0][1]
 def extract_effective_date_market_priority(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
     """
     Market-first effective date extractor.
 
     Updated behavior:
       - Finds candidate dates that appear after high-signal market/trading triggers.
+      - ALSO captures OTC/FINRA phrasing like "implemented effective December 18, 2025"
       - If filed_at is provided: DISALLOW any effective date that precedes the filing date.
         If the top candidate is before filed_at, it is dropped and we choose the next best.
         If no valid candidates remain, returns None.
       - Otherwise: choose best by trigger priority, then latest date within that priority.
-
-    Use in pipeline:
-      effective = extract_effective_date_market_priority(full_text, filed_at)
-      if effective is None:
-          effective = extract_effective_date(full_text, filed_at)  # broader fallback
     """
     if not text:
         return None
@@ -932,6 +1118,7 @@ def extract_effective_date_market_priority(text: str, filed_at: Optional[datetim
 
     candidates: List[Tuple[int, datetime, str]] = []  # (priority, dt, trigger_name)
 
+    # 1) Market trigger scanning (your existing logic)
     for name, trig in _MARKET_TRIGGERS:
         pr = _MARKET_PRIORITY.get(name, 99)
         for m in trig.finditer(tl):
@@ -950,10 +1137,30 @@ def extract_effective_date_market_priority(text: str, filed_at: Optional[datetim
 
             candidates.append((pr, dt, name))
 
+    # 2) NEW: “implemented effective …” style (ABQQ / FINRA language)
+    # We treat this as MARKET strength (high priority).
+    IMPLEMENTED_EFFECTIVE_PATTERNS = [
+        re.compile(r"\bimplemented\s+effective\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
+        re.compile(r"\bimplemented\s+on\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
+        re.compile(r"\b(became|becomes)\s+effective\s+on\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
+        re.compile(r"\bmarket\s+effective\s+date\b.*?(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE | re.DOTALL),
+    ]
+
+    for pat in IMPLEMENTED_EFFECTIVE_PATTERNS:
+        for m in pat.finditer(t):
+            raw = m.group("date")
+            try:
+                dt = dtparser.parse(raw, fuzzy=True)
+            except Exception:
+                continue
+
+            # priority 0 = "as good as it gets"
+            candidates.append((0, dt, "implemented_effective"))
+
     if not candidates:
         return None
 
-    # NEW: hard rule — do not allow an effective date earlier than the filing date
+    # Hard rule: do not allow an effective date earlier than the filing date
     if filed_at is not None:
         filing_date = filed_at.date()
         candidates = [c for c in candidates if c[1].date() >= filing_date]
@@ -969,6 +1176,67 @@ def extract_effective_date_market_priority(text: str, filed_at: Optional[datetim
     return candidates[0][1]
 
 
+# def extract_effective_date_market_priority(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
+#     """
+#     Market-first effective date extractor.
+
+#     Updated behavior:
+#       - Finds candidate dates that appear after high-signal market/trading triggers.
+#       - If filed_at is provided: DISALLOW any effective date that precedes the filing date.
+#         If the top candidate is before filed_at, it is dropped and we choose the next best.
+#         If no valid candidates remain, returns None.
+#       - Otherwise: choose best by trigger priority, then latest date within that priority.
+
+#     Use in pipeline:
+#       effective = extract_effective_date_market_priority(full_text, filed_at)
+#       if effective is None:
+#           effective = extract_effective_date(full_text, filed_at)  # broader fallback
+#     """
+#     if not text:
+#         return None
+
+#     t = _norm_text_html(text)
+#     tl = t.lower()
+
+#     candidates: List[Tuple[int, datetime, str]] = []  # (priority, dt, trigger_name)
+
+#     for name, trig in _MARKET_TRIGGERS:
+#         pr = _MARKET_PRIORITY.get(name, 99)
+#         for m in trig.finditer(tl):
+#             start = m.start()
+#             window = t[start: min(len(t), start + 2500)]
+
+#             dm = _DATE_ANY.search(window)
+#             if not dm:
+#                 continue
+
+#             raw = dm.group("date")
+#             try:
+#                 dt = dtparser.parse(raw, fuzzy=True)
+#             except Exception:
+#                 continue
+
+#             candidates.append((pr, dt, name))
+
+#     if not candidates:
+#         return None
+
+#     # NEW: hard rule — do not allow an effective date earlier than the filing date
+#     if filed_at is not None:
+#         filing_date = filed_at.date()
+#         candidates = [c for c in candidates if c[1].date() >= filing_date]
+#         if not candidates:
+#             return None
+
+#     # Rank: priority asc, then latest date desc
+#     def _rank(item: Tuple[int, datetime, str]) -> Tuple[int, float]:
+#         pr, dt, _name = item
+#         return (pr, -dt.timestamp())
+
+#     candidates.sort(key=_rank)
+#     return candidates[0][1]
+
+
 # --- update extract_details to pass filed_at into extract_effective_date ---
 def extract_details(text: str, filed_at: datetime) -> Extraction:
     ctx = extract_reverse_split_context(text)
@@ -976,7 +1244,14 @@ def extract_details(text: str, filed_at: datetime) -> Extraction:
         ctx = text
 
     ctx_l = ctx.lower()
-    rounding = UNKNOWN if ("reverse stock split" not in ctx_l and "reverse split" not in ctx_l) else classify_rounding_policy(ctx)
+    # rounding = UNKNOWN if ("reverse stock split" not in ctx_l and "reverse split" not in ctx_l) else classify_rounding_policy(ctx)
+    if ("reverse stock split" not in ctx_l and "reverse split" not in ctx_l):
+        rounding = UNKNOWN
+    else:
+        rounding = classify_rounding_policy(ctx)
+        # Fallback: ctx can miss the fractional-share paragraph
+        if rounding == UNKNOWN:
+            rounding = classify_rounding_policy(text)
 
     ratio_new, ratio_old = extract_ratio(ctx)
     # PRPH-first: try market-signal extraction on full text
