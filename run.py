@@ -90,6 +90,18 @@ class Runner:
         for filing in filings:
             counts["total"] += 1
 
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            age_hours = (now_et - filing.filed_at).total_seconds() / 3600
+
+            if age_hours > WINDOW_HOURS:
+                counts["rejected_by_policy"] += 1
+                print(
+                        f"Skipping old filing: {filing.accession} "
+                        f"({age_hours:.1f}h old, filed_at={filing.filed_at.isoformat()})"
+                    )
+                continue
+
+
             if not FORCE_REPROCESS and filing.accession in self.seen:
                 counts["skipped_seen"] += 1
                 continue
@@ -375,7 +387,12 @@ def debug_two_filings(index_urls: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    # --- Single filing debug (CODX 8-K) ---
+    # index_urls = [
+    #     "https://www.sec.gov/Archives/edgar/data/868278/000149315225028317/0001493152-25-028317-index.html",
+    #     "https://www.sec.gov/Archives/edgar/data/1624512/000162828025058104/0001628280-25-058104-index.html"
+    # ]
+    # debug_two_filings(index_urls)
+
 
     runner = Runner()
     results = runner.run()

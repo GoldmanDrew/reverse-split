@@ -151,7 +151,9 @@ class TickerMap:
 
 FORMS_OF_INTEREST = [
     "8-K",
-    "8-K/A"
+    "8-K/A",
+    "6-K",
+    "6-K/A"
 ]
 
 _ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")

@@ -26,6 +26,8 @@ RATIO_PAREN_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+
+
 RATIO_RE = re.compile(
     r"\b(\d{1,3}(?:,\d{3})*)\s*[-–]\s*for\s*[-–]\s*(\d{1,3}(?:,\d{3})*)\b",
     re.IGNORECASE
@@ -38,6 +40,50 @@ NUMBER_WORDS = {
     "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
     "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
 }
+
+HUNDREDS = {"hundred": 100, "thousand": 1000}
+
+def _words_to_int(s: str) -> Optional[int]:
+    """
+    Convert simple English number words up to a few thousand.
+    Handles: "two hundred and twenty", "one thousand", "two thousand two hundred".
+    """
+    if not s:
+        return None
+    s = s.lower().replace("-", " ")
+    tokens = [t for t in re.split(r"\s+", s) if t and t != "and"]
+
+    total = 0
+    cur = 0
+
+    for tok in tokens:
+        if tok in NUMBER_WORDS:
+            cur += NUMBER_WORDS[tok]
+        elif tok == "hundred":
+            if cur == 0:
+                cur = 1
+            cur *= 100
+        elif tok == "thousand":
+            if cur == 0:
+                cur = 1
+            total += cur * 1000
+            cur = 0
+        else:
+            # unknown token
+            return None
+
+    return total + cur if (total + cur) > 0 else None
+
+# OCG-style: "receive one post-consolidation ... for every two hundred and twenty pre-consolidation ..."
+
+PROSE_RECEIVE_FOR_EVERY_WORDS = re.compile(
+    r"shareholders?\s+will\s+receive\s+(?:one|\(?1\)?)\s+"
+    r"(?:post-?consolidation\s+)?(?:ordinary\s+)?shares?\s+for\s+every\s+"
+    r"(?P<old_words>[a-z\s-]+?)\s+"
+    r"(?:pre-?consolidation\s+)?(?:ordinary\s+)?shares?",
+    re.IGNORECASE,
+)
+
 
 PROSE_RATIO_PATTERN = re.compile(
     r"(?:every\s+)?(?P<old_word>[a-z]+)\s*\(?(?P<old_num>\d{1,3})\)?\s+shares?"
@@ -65,13 +111,22 @@ from typing import Optional, Tuple
 # --- Patterns (broad but guarded by scoring) ---
 NUM_COMMA = r"\d{1,3}(?:,\d{3})*|\d+"
 
+RATIO_RANGE_PATTERN = re.compile(
+    rf"ranging\s+from\s+(?P<a_new>{NUM_COMMA})\s*[-–]?\s*for\s*[-–]?\s*(?P<a_old>{NUM_COMMA})"
+    rf"\s+to\s+(?P<b_new>{NUM_COMMA})\s*[-–]?\s*for\s*[-–]?\s*(?P<b_old>{NUM_COMMA})",
+    re.IGNORECASE,
+)
 
-# RATIO_FOR_PATTERN = re.compile(
-#     r"(?P<new>\d{1,5})\s*(?:-?\s*for\s*-?)\s*(?P<old>\d{1,5})",
-#     re.IGNORECASE,
-# )
+EXECUTION_WINDOW_RE = re.compile(
+    r"(will\s+become\s+effective|became\s+effective|effective\s+on|effective\s+as\s+of|"
+    r"will\s+begin\s+trading|begin\s+trading|split-adjusted|board\s+(?:has\s+)?determined|"
+    r"board\s+(?:has\s+)?fixed|set\s+the\s+ratio|ratio\s+of\s+the\s+reverse\s+split)",
+    re.IGNORECASE,
+)
+
+
 RATIO_FOR_PATTERN = re.compile(
-    rf"\b(?P<new>{NUM_COMMA})\s*[-–]\s*for\s*[-–]\s*(?P<old>{NUM_COMMA})\b",
+    rf"\b(?P<new>{NUM_COMMA})\s*[-–]?\s*for\s*[-–]?\s*(?P<old>{NUM_COMMA})\b",
     re.IGNORECASE
 )
 
@@ -216,25 +271,55 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
         if "date of report" in w or "dated" in w:
             return True
         return False
+    def is_range_context(start: int, end: int) -> bool:
+        w = tl[max(0, start - 160): min(len(tl), end + 160)]
+        # Common “authorization / board discretion” phrasing
+        if "ranging from" in w or "range" in w:
+            return True
+        if "to be determined" in w or "in its sole discretion" in w or "board" in w:
+            return True
+        # If the nearby text contains another ratio and a "to", it's almost certainly a range.
+        # Example: "1-for-10 to 1-for-30"
+        if " to " in w and len(list(RATIO_FOR_PATTERN.finditer(w))) >= 2:
+            return True
+        return False
+    for m in EXECUTION_WINDOW_RE.finditer(t):
+        win = t[m.start(): min(len(t), m.start() + 2500)]
+        m2 = RATIO_FOR_PATTERN.search(win) or RATIO_COLON_PATTERN.search(win)
+        if m2:
+            new = _to_int(m2.group("new"))
+            old = _to_int(m2.group("old"))
+            if 0 < new < old:
+                return new, old
 
-
-    # Numeric X-for-Y
     for m in RATIO_FOR_PATTERN.finditer(t):
         new = _to_int(m.group("new"))
         old = _to_int(m.group("old"))
 
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        if not looks_like_date_nearby(m.start(), m.end()):
-            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if looks_like_date_nearby(m.start(), m.end()):
+            continue
 
+        # NEW: skip/penalize authorization ranges
+        if is_range_context(m.start(), m.end()):
+            # Option A (best): SKIP range candidates entirely
+            continue
+
+        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window)) 
     # Colon X:Y
     for m in RATIO_COLON_PATTERN.finditer(t):
         new = _to_int(m.group("new"))
         old = _to_int(m.group("old"))
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        if not looks_like_date_nearby(m.start(), m.end()):
-            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if looks_like_date_nearby(m.start(), m.end()):
+            continue
 
+        # NEW: skip/penalize authorization ranges
+        if is_range_context(m.start(), m.end()):
+            # Option A (best): SKIP range candidates entirely
+            continue
+
+        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window)) 
     # Prose: each/every ... (N) shares ... into (1) share
         # Prose: each/every ... (N) shares ... into (M) shares
     for m in PROSE_EVERY_PATTERN.finditer(t):
@@ -252,6 +337,22 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
         window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
         if not looks_like_date_nearby(m.start(), m.end()):
             candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        # NEW: OCG-style number-words ratio
+   
+    rm = RATIO_RANGE_PATTERN.search(t)
+    if rm:
+        a_new, a_old = _to_int(rm.group("a_new")), _to_int(rm.group("a_old"))
+        b_new, b_old = _to_int(rm.group("b_new")), _to_int(rm.group("b_old"))
+
+        # normalize so "1-for-30" is the larger "old"
+        lo = (a_new, a_old) if a_old <= b_old else (b_new, b_old)
+        hi = (b_new, b_old) if a_old <= b_old else (a_new, a_old)
+
+        # If we got an effective date/trading language but no exact ratio, choose HI bound.
+        # (This matches your PAVM reality but still keeps logic explicit.)
+        if "will become effective" in tl or "begin trading on a split-adjusted basis" in tl:
+            return hi
+
 
     if not candidates:
         return None, None
@@ -478,8 +579,8 @@ def _score_date_context(ctx: str) -> int:
         score -= 1300
     if "will begin trading" in c or "begin trading" in c or "commence trading" in c:
         score -= 1000
-    if "will become effective" in c or "become effective" in c or "will be effective" in c:
-        score -= 1200
+    if "will become effective" in c or "become effective" in c or "will be effective" in c or "begin trading on a split-adjusted basis" in c:
+        score -= 2200
 
     if "certificate of amendment" in c:
         score += 1500
@@ -834,7 +935,12 @@ def extract_reverse_split_context(text: str, window: int = 6500) -> str:
         "reverse stock split",
         "reverse split",
         # keep it, but penalize it (often points to the wrong “became effective” clause)
-        "certificate of amendment",
+         "share consolidation",
+        "stock consolidation",
+        "post-consolidation",
+        "pre-consolidation",
+        "no fractional shares",
+        "fractional shares will be",
     ]
 
     candidates: List[Tuple[int, str]] = []
@@ -893,7 +999,6 @@ def extract_reverse_split_context(text: str, window: int = 6500) -> str:
 
 
 def contains_reverse_split_language(text: str) -> bool:
-    # normalize all whitespace/newlines to single spaces
     t = " ".join((text or "").lower().split())
 
     strong = [
@@ -901,9 +1006,25 @@ def contains_reverse_split_language(text: str) -> bool:
         "reverse split",
         "split-adjusted",
         "trading on a split-adjusted basis",
-        "reverse-stock split",   # optional: sometimes hyphenated
+        "reverse-stock split",
+        # NEW (OCG / FPIs):
+        "share consolidation",
+        "stock consolidation",
+        "consolidation of shares",
+        "post-consolidation",
+        "pre-consolidation",
     ]
-    return any(k in t for k in strong)
+
+    if any(k in t for k in strong):
+        # Guard: avoid matching generic “consolidated financial statements”
+        if "consolidated financial statements" in t and (
+            "share consolidation" not in t and "stock consolidation" not in t
+        ):
+            return False
+        return True
+
+    return False
+
 
 
 def _contains_words(text: str, words) -> bool:
@@ -1244,14 +1365,23 @@ def extract_details(text: str, filed_at: datetime) -> Extraction:
         ctx = text
 
     ctx_l = ctx.lower()
-    # rounding = UNKNOWN if ("reverse stock split" not in ctx_l and "reverse split" not in ctx_l) else classify_rounding_policy(ctx)
-    if ("reverse stock split" not in ctx_l and "reverse split" not in ctx_l):
+
+    # Run rounding classification for BOTH reverse splits and share consolidations
+    is_splitish = (
+        "reverse stock split" in ctx_l
+        or "reverse split" in ctx_l
+        or "share consolidation" in ctx_l
+        or "stock consolidation" in ctx_l
+        or "post-consolidation" in ctx_l
+        or "pre-consolidation" in ctx_l
+    )
+
+    if not is_splitish:
         rounding = UNKNOWN
     else:
         rounding = classify_rounding_policy(ctx)
-        # Fallback: ctx can miss the fractional-share paragraph
         if rounding == UNKNOWN:
-            rounding = classify_rounding_policy(text)
+            rounding = classify_rounding_policy(text)  # fallback to full doc
 
     ratio_new, ratio_old = extract_ratio(ctx)
     # PRPH-first: try market-signal extraction on full text
