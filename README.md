@@ -46,7 +46,30 @@ reverse-split/
    ```bash
    python run.py
    ```
-   Results are written to `data/results.json` (and CSV) and cached filings/prices are stored under `data/`.
+Results are written to `data/results.json` (and CSV) and cached filings/prices are stored under `data/`.
+
+### Automated trading (IBKR)
+
+To automatically short an equal-weight basket of flagged candidates through IBKR:
+
+1. Install the optional dependency: `pip install -r requirements.txt` (includes `ib-insync`).
+2. Run IBKR Gateway or TWS and expose the API.
+3. Set trading environment variables:
+   ```bash
+   export ENABLE_IBKR_TRADING=1
+   export IBKR_HOST=127.0.0.1
+   export IBKR_PORT=7497              # or paper 7497/live 7496
+   export IBKR_CLIENT_ID=18
+   export IBKR_TOTAL_NOTIONAL=25000   # total dollar notional to split equally
+   export MAX_BORROW_RATE=0.25        # skip names with fee rate above 25%
+   export COMPLIANCE_PRICE=1.15       # drop if 2 closes above this level
+   export COMPLIANCE_DAYS=2
+   ```
+4. Execute `python run.py`. After the screener runs, the bot will:
+   - Drop ADR/ETF/Canadian issuers (existing filters).
+   - Skip names that already closed above $1.00/$1.15 for two sessions.
+   - Skip names with borrow fee rates above your threshold.
+   - Submit Adaptive market short orders sized equally by notional.
 
 ## Automation (GitHub Actions)
 
