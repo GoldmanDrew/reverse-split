@@ -19,7 +19,7 @@ PRICE_CACHE_PATH = Path("price_cache.json")
 REJECTIONS_JSON = DATA_DIR / "rejections.json"
 REJECTIONS_CSV = DATA_DIR / "rejections.csv"
 
-WINDOW_HOURS = 72
+WINDOW_HOURS = 84
 
 USER_AGENT = edgar.USER_AGENT
 
@@ -498,7 +498,7 @@ def explain_would_include(
     return would_include, reasons
 
 
-def debug_two_filings(index_urls: list[str], WINDOW_HOURS: int = 72) -> None:
+def debug_two_filings(index_urls: list[str], WINDOW_HOURS: int = 84) -> None:
     runner = Runner()
     print("\n========== DEBUG TWO FILINGS ==========")
     for idx_url in index_urls:
