@@ -92,13 +92,18 @@ class Runner:
             counts["total"] += 1
 
             now_et = datetime.now(ZoneInfo("America/New_York"))
-            age_hours = (now_et - filing.filed_at).total_seconds() / 3600
+            filing_time = filing.filed_at
+            if filing_time.tzinfo is None:
+                filing_time = filing_time.replace(tzinfo=ZoneInfo("America/New_York"))
+            else:
+                filing_time = filing_time.astimezone(ZoneInfo("America/New_York"))
+            age_hours = (now_et - filing_time).total_seconds() / 3600
 
             if age_hours > WINDOW_HOURS:
                 counts["rejected_by_policy"] += 1
                 print(
                         f"Skipping old filing: {filing.accession} "
-                        f"({age_hours:.1f}h old, filed_at={filing.filed_at.isoformat()})"
+                        f"({age_hours:.1f}h old, filed_at={filing_time.isoformat()})"
                     )
                 continue
 
@@ -213,7 +218,7 @@ class Runner:
                 "ticker": ticker,
                 "exchange": exchange,
                 "form": filing.form,
-                "filed_at": filing.filed_at.isoformat(),
+                "filed_at": filing_time.isoformat(),
                 "filing_url": filing_url,   # <-- NEW
                 "effective_date": extraction.effective_date.isoformat() if extraction.effective_date else None,
                 "ratio_display": f"{extraction.ratio_new}-for-{extraction.ratio_old}",
