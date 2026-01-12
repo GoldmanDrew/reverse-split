@@ -520,14 +520,13 @@ def debug_two_filings(index_urls: list[str], WINDOW_HOURS: int = 72) -> None:
 
 
 if __name__ == "__main__":
-    index_urls = [
-        "https://www.sec.gov/Archives/edgar/data/868278/000149315225028317/0001493152-25-028317-index.html",
-        "https://www.sec.gov/Archives/edgar/data/1624512/000162828025058104/0001628280-25-058104-index.html"
-    ]
-    debug_two_filings(index_urls)
+    # index_urls = [
+    #     "https://www.sec.gov/Archives/edgar/data/868278/000149315225028317/0001493152-25-028317-index.html",
+    #     "https://www.sec.gov/Archives/edgar/data/1624512/000162828025058104/0001628280-25-058104-index.html"
+    # ]
+    # debug_two_filings(index_urls)
 
-
-    # runner = Runner()
-    # results = runner.run()
-    # maybe_email(results)
-    # print(f"Wrote {len(results)} results to {RESULTS_JSON}")
+    runner = Runner()
+    results = runner.run()
+    maybe_email(results)
+    print(f"Wrote {len(results)} results to {RESULTS_JSON}")
