@@ -83,6 +83,7 @@ class Runner:
             "reverse_lang": 0,
             "rejected_by_policy": 0,
             "accepted": 0,
+            "missing_effective_date": 0,
         }
 
         results: List[dict] = []
@@ -116,17 +117,39 @@ class Runner:
             if parse.is_delisting_notice_only(text):
                 counts["rejected_by_policy"] += 1
                 continue
-
-            if not parse.contains_reverse_split_language(text):
+            # 1) Reverse-split trigger
+            has_reverse = parse.contains_reverse_split_language(text)
+            if not has_reverse:
                 counts["no_reverse_lang"] += 1
                 continue
 
+            # 2) NEW: Require a fresh event date (Period of Report / earliest event reported)
+            event_dt = parse.extract_event_reported_datetime(text)
+
+            if event_dt is None:
+                # STRICT: if it fired "reverse split language" but we can't locate an event date,
+                # we do NOT allow it through (prevents stale/boilerplate false positives).
+                counts["rejected_by_policy"] += 1
+                print(f"Skipping reverse-lang filing with no event date parsed: {filing.accession}")
+                continue
+
+            event_age_hours = (now_et - event_dt).total_seconds() / 3600
+            if event_age_hours > WINDOW_HOURS:
+                counts["rejected_by_policy"] += 1
+                print(
+                    f"Skipping stale period-of-report: {filing.accession} "
+                    f"({event_age_hours:.1f}h old, event_dt={event_dt.isoformat()})"
+                )
+                continue
+
             counts["reverse_lang"] += 1
+
 
             if not FORCE_REPROCESS:
                 self.seen.add(filing.accession)
 
             extraction = parse.extract_details(text, filed_at=filing.filed_at)
+            
 
             meta = self.tickers.lookup(filing.cik)
             ticker_map = (meta.get("ticker") or "").upper().strip()
@@ -161,11 +184,22 @@ class Runner:
             )
 
             today = datetime.now(ZoneInfo("America/New_York")).date()
+            if extraction.effective_date is None:
+                counts["rejected_by_policy"] += 1
+                print(f"Effective date not found")
+                continue
 
             if extraction.effective_date is not None and extraction.effective_date.date() < today:
                 counts["rejected_by_policy"] += 1
                 print(f"Effective date already passed ({extraction.effective_date.date().isoformat()})")
                 continue
+
+            # Reject explicit ROUND_DOWN policies
+            if extraction.rounding_policy == parse.ROUND_DOWN:
+                counts["rejected_by_policy"] += 1
+                print(f"Skipping: explicit ROUND_DOWN rounding policy ({filing.accession})")
+                continue
+
 
             # Build an SEC filing index URL (works even if the Filing object doesn't store a URL)
             acc_no_dashes = filing.accession.replace("-", "")
@@ -189,6 +223,8 @@ class Runner:
                 "price": None,
                 "potential_profit": None,
                 "rejection_reason": rejection,
+                "event_dt": event_dt.isoformat() if event_dt else None,
+                "event_age_hours": round(event_age_hours, 2) if event_dt else None,
             }
 
             if rejection is None:
@@ -329,12 +365,59 @@ def _fetch_sec_index_and_find_primary_txt(index_url: str, session: requests.Sess
     # If relative without leading slash (rare)
     return "https://www.sec.gov/" + href.lstrip("/")
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-def debug_two_filings(index_urls: list[str]) -> None:
+def explain_would_include(
+    text: str,
+    extraction,
+    event_is_fresh: bool,
+    filed_at=None,
+    now_et: datetime | None = None,
+) -> tuple[bool, list[str]]:
     """
-    Fetch each SEC index page, resolve the primary .txt filing, and run parse/extract on it.
-    Prints the extracted fields and context around key phrases.
+    Mirrors production gating and returns human-readable reasons.
     """
+    if now_et is None:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+
+    reasons: list[str] = []
+
+    # Gate 1: delisting-only
+    if parse.is_delisting_notice_only(text):
+        reasons.append("FAIL: delisting notice only")
+
+    # Gate 2: reverse split language
+    if not parse.contains_reverse_split_language(text):
+        reasons.append("FAIL: no reverse-split language detected")
+
+    # Gate 3: freshness (your event-based freshness flag)
+    if not event_is_fresh:
+        reasons.append("FAIL: event is not fresh (outside WINDOW_HOURS)")
+
+    # Gate 4: effective date exists
+    if extraction.effective_date is None:
+        reasons.append("FAIL: effective_date not found")
+
+    # Optional: these are *additional* gates you apply later, so include them too
+    if extraction.rounding_policy == parse.ROUND_DOWN:
+        reasons.append("FAIL: explicit ROUND_DOWN policy")
+
+    # Optional: effective date already passed (you check this later)
+    if extraction.effective_date is not None:
+        today = now_et.date()
+        if extraction.effective_date.date() < today:
+            reasons.append(f"FAIL: effective_date already passed ({extraction.effective_date.date().isoformat()})")
+
+    would_include = (len(reasons) == 0)
+
+    if would_include:
+        reasons.append("PASS: meets all inclusion gates")
+
+    return would_include, reasons
+
+
+def debug_two_filings(index_urls: list[str], WINDOW_HOURS: int = 72) -> None:
     runner = Runner()
     print("\n========== DEBUG TWO FILINGS ==========")
     for idx_url in index_urls:
@@ -348,14 +431,29 @@ def debug_two_filings(index_urls: list[str]) -> None:
         resp.raise_for_status()
         text = resp.text
 
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+
+        # --- Event freshness gate ---
+        event_dt = parse.extract_event_reported_datetime(text)
+        event_age_hours = (
+            (now_et - event_dt).total_seconds() / 3600
+            if event_dt else None
+        )
+        event_is_fresh = (
+            event_age_hours is not None and event_age_hours <= WINDOW_HOURS
+        )
+
+        print("event_dt:", event_dt.isoformat() if event_dt else None)
+        print("event_age_hours:", round(event_age_hours, 2) if event_age_hours else None)
+        print("event_is_fresh:", event_is_fresh)
+
         print("TXT length:", len(text))
 
-        # Core detection
         print("contains_reverse_split_language:", parse.contains_reverse_split_language(text))
         print("is_delisting_notice_only:", parse.is_delisting_notice_only(text))
 
-        # Extraction
-        filed_at_guess = datetime.now(ZoneInfo("America/New_York"))
+        # ---- Extraction (MUST happen before include decision) ----
+        filed_at_guess = now_et
         extraction = parse.extract_details(text, filed_at=filed_at_guess)
 
         print("\n[EXTRACTED]")
@@ -365,7 +463,27 @@ def debug_two_filings(index_urls: list[str]) -> None:
         print("  effective_date:", extraction.effective_date)
         print("  rounding_policy:", extraction.rounding_policy)
 
-        # Context helpers (so you can see why a regex hit/missed)
+        # ---- FINAL POLICY DECISION (matches production) ----
+        would_include = (
+            not parse.is_delisting_notice_only(text)
+            and parse.contains_reverse_split_language(text)
+            and event_is_fresh
+            and extraction.effective_date is not None
+        )
+
+        would_include, reasons = explain_would_include(
+            text=text,
+            extraction=extraction,
+            event_is_fresh=event_is_fresh,
+            filed_at=filed_at_guess,
+            now_et=now_et,
+        )
+
+        print("WOULD_INCLUDE (policy):", would_include)
+        for r in reasons:
+            print("  -", r)
+
+        # Context helpers unchanged
         def show_context(pattern: str, label: str, window: int = 220):
             m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
             if not m:
@@ -374,27 +492,37 @@ def debug_two_filings(index_urls: list[str]) -> None:
             s, e = m.start(), m.end()
             lo = max(0, s - window)
             hi = min(len(text), e + window)
-            snippet = text[lo:hi]
             print(f"\n[CTX] {label}: FOUND")
-            print(snippet)
+            print(text[lo:hi])
 
-        # Show likely sources of errors
-        show_context(r"\b\d{1,3}(?:,\d{3})*\s*[-–]\s*for\s*[-–]\s*\d{1,3}(?:,\d{3})*\b", "hyphenated ratio X-for-Y")
-        show_context(r"between\s+one[-\s]*for[-\s]*two.*one[-\s]*for[-\s]*ten", "ratio RANGE language (authorization)")
-        show_context(r"implemented\s+effective|will\s+be\s+effective|effective\s+date|market\s+effective\s+date|begin\s+trading\s+on\s+a\s+split-adjusted\s+basis", "effective-date language")
-        show_context(r"fractional\s+share|no\s+fractional\s+shares|rounded\s+up|cash\s+in\s+lieu|paid\s+in\s+cash", "fractional/rounding language")
+        show_context(
+            r"\b\d{1,3}(?:,\d{3})*\s*[-–]\s*for\s*[-–]\s*\d{1,3}(?:,\d{3})*\b",
+            "hyphenated ratio X-for-Y",
+        )
+        show_context(
+            r"between\s+one[-\s]*for[-\s]*two.*one[-\s]*for[-\s]*ten",
+            "ratio RANGE language (authorization)",
+        )
+        show_context(
+            r"implemented\s+effective|will\s+be\s+effective|effective\s+date|market\s+effective\s+date|begin\s+trading\s+on\s+a\s+split-adjusted\s+basis",
+            "effective-date language",
+        )
+        show_context(
+            r"fractional\s+share|no\s+fractional\s+shares|rounded\s+up|cash\s+in\s+lieu|paid\s+in\s+cash",
+            "fractional/rounding language",
+        )
 
 
 
 if __name__ == "__main__":
-    # index_urls = [
-    #     "https://www.sec.gov/Archives/edgar/data/868278/000149315225028317/0001493152-25-028317-index.html",
-    #     "https://www.sec.gov/Archives/edgar/data/1624512/000162828025058104/0001628280-25-058104-index.html"
-    # ]
-    # debug_two_filings(index_urls)
+    index_urls = [
+        "https://www.sec.gov/Archives/edgar/data/868278/000149315225028317/0001493152-25-028317-index.html",
+        "https://www.sec.gov/Archives/edgar/data/1624512/000162828025058104/0001628280-25-058104-index.html"
+    ]
+    debug_two_filings(index_urls)
 
 
-    runner = Runner()
-    results = runner.run()
-    maybe_email(results)
-    print(f"Wrote {len(results)} results to {RESULTS_JSON}")
+    # runner = Runner()
+    # results = runner.run()
+    # maybe_email(results)
+    # print(f"Wrote {len(results)} results to {RESULTS_JSON}")

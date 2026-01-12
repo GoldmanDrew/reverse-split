@@ -4,75 +4,30 @@ from datetime import datetime
 from typing import List, Optional
 
 from dateutil import parser as dateparser
+from zoneinfo import ZoneInfo
+from typing import Optional, Tuple
+import html
 
 ROUND_UP = "ROUND_UP"
+ROUND_DOWN = "ROUND_DOWN"          # NEW
 CASH_IN_LIEU = "CASH_IN_LIEU"
 FRACTIONAL_ISSUED = "FRACTIONAL_ISSUED"
 UNKNOWN = "UNKNOWN"
 
 DATE_PATTERNS: List[re.Pattern] = [
+    # Existing
     re.compile(r"effective\s+(?:as of\s+)?(?:on\s+)?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
     re.compile(r"will\s+become\s+effective[\w\s,]*?on\s+(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
     re.compile(r"on\s+(?P<date>\d{1,2}/\d{1,2}/\d{2,4})\s*,?\s*(?:at\s+\d{1,2}:\d{2}\s*(?:a\.m\.|p\.m\.|am|pm))?", re.IGNORECASE),
+
+    # NEW: common alternatives
+    re.compile(r"expects?\s+to\s+implement[\w\s,]*?effective\s+(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
+    re.compile(r"will\s+be\s+implemented[\w\s,]*?(?:on\s+)?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
+    re.compile(r"will\s+(?:take\s+place|occur)\s+(?:on\s+)?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
+    re.compile(r"(?:market\s+)?effective\s+date[\w\s,]*?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
+    re.compile(r"begin\s+trading[\w\s,]*?(?:on\s+)?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
+    re.compile(r"share\s+consolidation[\w\s,]*?(?:on\s+)?(?P<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.IGNORECASE),
 ]
-
-RATIO_PATTERN = re.compile(
-    r"(?P<new>\d{1,3})\s*[- ]?for\s*[- ]?(?P<old>\d{1,3})", re.IGNORECASE
-)
-
-RATIO_PAREN_PATTERN = re.compile(
-    r"(?:one|\(?1\)?)\s*(?:share)?\s*(?:for|into|to)\s*(?:every\s*)?"
-    r"(?:forty|\(?40\)?)\s*(?:shares?)",
-    re.IGNORECASE
-)
-
-
-
-RATIO_RE = re.compile(
-    r"\b(\d{1,3}(?:,\d{3})*)\s*[-–]\s*for\s*[-–]\s*(\d{1,3}(?:,\d{3})*)\b",
-    re.IGNORECASE
-)
-
-
-NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-}
-
-HUNDREDS = {"hundred": 100, "thousand": 1000}
-
-def _words_to_int(s: str) -> Optional[int]:
-    """
-    Convert simple English number words up to a few thousand.
-    Handles: "two hundred and twenty", "one thousand", "two thousand two hundred".
-    """
-    if not s:
-        return None
-    s = s.lower().replace("-", " ")
-    tokens = [t for t in re.split(r"\s+", s) if t and t != "and"]
-
-    total = 0
-    cur = 0
-
-    for tok in tokens:
-        if tok in NUMBER_WORDS:
-            cur += NUMBER_WORDS[tok]
-        elif tok == "hundred":
-            if cur == 0:
-                cur = 1
-            cur *= 100
-        elif tok == "thousand":
-            if cur == 0:
-                cur = 1
-            total += cur * 1000
-            cur = 0
-        else:
-            # unknown token
-            return None
-
-    return total + cur if (total + cur) > 0 else None
 
 # OCG-style: "receive one post-consolidation ... for every two hundred and twenty pre-consolidation ..."
 
@@ -84,18 +39,15 @@ PROSE_RECEIVE_FOR_EVERY_WORDS = re.compile(
     re.IGNORECASE,
 )
 
-
-PROSE_RATIO_PATTERN = re.compile(
-    r"(?:every\s+)?(?P<old_word>[a-z]+)\s*\(?(?P<old_num>\d{1,3})\)?\s+shares?"
-    r".{0,80}?"
-    r"(?:one|\(?1\)?)\s+share",
-    re.IGNORECASE
+PROSE_RECEIVE_WORDS_PATTERN = re.compile(
+    r"receive\s+(?P<new>(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten))\s+"
+    r"(?:post[-\s]*consolidation|post[-\s]*split|consolidated)?"
+    r".{0,120}?\sfor\s+every\s+"
+    r"(?P<old>(?:\d+|[a-z\s-]{3,120}?))\s+"
+    r"(?=(?:pre[-\s]*consolidation|pre[-\s]*split|ordinary\s+shares|shares))",
+    re.IGNORECASE | re.DOTALL
 )
 
-COLON_RATIO_PATTERN = re.compile(
-    r"(?P<new>\d{1,3})\s*:\s*(?P<old>\d{1,3})",
-    re.IGNORECASE
-)
 
 @dataclass
 class Extraction:
@@ -104,9 +56,6 @@ class Extraction:
     effective_date: Optional[datetime]
     rounding_policy: str
     matches_rounding: bool
-
-import re
-from typing import Optional, Tuple
 
 # --- Patterns (broad but guarded by scoring) ---
 NUM_COMMA = r"\d{1,3}(?:,\d{3})*|\d+"
@@ -156,17 +105,12 @@ PROSE_INTO_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Sometimes: “reverse split at a ratio of 1-for-40” or “on a 1:40 basis”
-BASIS_HINT_PATTERN = re.compile(
-    r"(?:ratio|basis)\b",
-    re.IGNORECASE,
+PROSE_CONSOLIDATION_FOR_EVERY = re.compile(
+    r"(?:shareholders?\s+will\s+)?receive\s+(?P<new>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r".{0,80}?\sfor\s+every\s+(?P<old>\d+|[a-z\s-]{3,80})\s+"
+    r"(?:pre[-\s]*consolidation|pre[-\s]*split|ordinary\s+shares|shares)",
+    re.IGNORECASE | re.DOTALL
 )
-
-import html
-import re
-from datetime import datetime
-from typing import Optional
-from dateutil import parser as dtparser
 
 # Normalize common Unicode dashes to ASCII "-"
 _DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
@@ -199,6 +143,7 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
 
     t = _norm_text_html(text)
     tl = t.lower()
+
         # Guardrail: authorization/range language (not a finalized split)
     if ("ratio of between" in tl or "within a range" in tl or "to be determined by our board" in tl) and \
        ("one-for-two" in tl and "one-for-ten" in tl) and \
@@ -261,95 +206,297 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
         return int(x.replace(",", "").strip())
     
     MONTH_WORDS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec")
-
     def looks_like_date_nearby(start: int, end: int) -> bool:
-        w = tl[max(0, start - 40): min(len(tl), end + 40)]
-        # “Dec. 29, 2025” patterns often have a month word + a comma + a 4-digit year nearby
+        # Larger window so we can see reverse-split context even if a date is nearby
+        w = tl[max(0, start - 80): min(len(tl), end + 120)]
+
+        # If ratio is in actual reverse-split context, do NOT skip just because a date is nearby
+        if any(k in w for k in (
+            "reverse stock split",
+            "reverse split",
+            "split-adjusted",
+            "will begin trading",
+            "begin trading",
+            "cusip",
+            "effective at the opening of trading",
+            "opening of trading",
+        )):
+            return False
+
+        # Otherwise keep the conservative date filter
         if any(mo in w for mo in MONTH_WORDS) and re.search(r"\b(19|20)\d{2}\b", w) and "," in w:
             return True
-        # Also guard "date of report"
+
         if "date of report" in w or "dated" in w:
             return True
-        return False
-    def is_range_context(start: int, end: int) -> bool:
-        w = tl[max(0, start - 160): min(len(tl), end + 160)]
-        # Common “authorization / board discretion” phrasing
-        if "ranging from" in w or "range" in w:
-            return True
-        if "to be determined" in w or "in its sole discretion" in w or "board" in w:
-            return True
-        # If the nearby text contains another ratio and a "to", it's almost certainly a range.
-        # Example: "1-for-10 to 1-for-30"
-        if " to " in w and len(list(RATIO_FOR_PATTERN.finditer(w))) >= 2:
-            return True
-        return False
-    for m in EXECUTION_WINDOW_RE.finditer(t):
-        win = t[m.start(): min(len(t), m.start() + 2500)]
-        m2 = RATIO_FOR_PATTERN.search(win) or RATIO_COLON_PATTERN.search(win)
-        if m2:
-            new = _to_int(m2.group("new"))
-            old = _to_int(m2.group("old"))
-            if 0 < new < old:
-                return new, old
 
+        return False
+
+    import re
+
+    _NUMWORDS = {
+        "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,
+        "eleven":11,"twelve":12,"thirteen":13,"fourteen":14,"fifteen":15,"sixteen":16,"seventeen":17,"eighteen":18,"nineteen":19,
+        "twenty":20,"thirty":30,"forty":40,"fifty":50,"sixty":60,"seventy":70,"eighty":80,"ninety":90,
+    }
+    _SCALES = {"hundred":100, "thousand":1000}
+
+    def words_to_int(s: str) -> int | None:
+        s = s.lower()
+        s = re.sub(r"[^a-z\s-]", " ", s)
+        s = s.replace("-", " ")
+        tokens = [t for t in s.split() if t not in ("and",)]
+        if not tokens:
+            return None
+
+        total = 0
+        current = 0
+        seen = False
+
+        for t in tokens:
+            if t in _NUMWORDS:
+                current += _NUMWORDS[t]
+                seen = True
+            elif t in _SCALES:
+                seen = True
+                scale = _SCALES[t]
+                if current == 0:
+                    current = 1
+                current *= scale
+                if scale >= 1000:
+                    total += current
+                    current = 0
+            else:
+                return None
+
+        return total + current if seen else None
+
+
+    def is_range_context(start: int, end: int) -> bool:
+        w = tl[max(0, start - 200): min(len(tl), end + 200)]
+
+        # Strong range indicators
+        range_phrases = (
+            "ranging from",
+            "within a range",
+            "ratio of between",
+            "between",
+            "range",
+            "up to",
+            "not more than",
+            "to be determined",
+            "in its sole discretion",
+            "at the discretion",
+        )
+
+        if any(p in w for p in range_phrases):
+            # Extra confirmation: often range language shows multiple ratios nearby (e.g. 1-for-10 to 1-for-30)
+            if " to " in w and len(list(RATIO_FOR_PATTERN.finditer(w))) >= 2:
+                return True
+            # Or explicit “between one-for-x and one-for-y”
+            if "between" in w and len(list(RATIO_FOR_PATTERN.finditer(w))) >= 2:
+                return True
+            # If it says "to be determined"/"discretion", it's range even with one ratio present
+            if "to be determined" in w or "sole discretion" in w or "at the discretion" in w:
+                return True
+
+        # “aggregate ratio approved by shareholders” is usually authorization language
+        if "aggregate ratio" in w and ("approved" in w) and ("shareholder" in w or "stockholder" in w):
+            return True
+
+        return False
+
+    # --- Optional but very helpful: filter out CSS/HTML junk ratios in giant filings ---
+    def looks_like_style_junk(start: int, end: int) -> bool:
+        w = tl[max(0, start - 140): min(len(tl), end + 140)]
+        junk_tokens = ("font:", "margin:", "style=", "<p", "</p", "<div", "</div", "&nbsp;", "times new roman")
+        if any(tok in w for tok in junk_tokens):
+            # Don't reject if it's clearly in reverse-split context
+            if any(k in w for k in ("reverse stock split", "reverse split", "split-adjusted", "begin trading", "cusip", "effective")):
+                return False
+            return True
+        return False
+
+    # -----------------------------
+    # 1) EXECUTION WINDOW: collect ALL candidates, choose BEST (do not early-return first match)
+    # -----------------------------
+    best_exec = None  # tuple: (score, new, old)
+
+    for m in EXECUTION_WINDOW_RE.finditer(t):
+        win_start = m.start()
+        win_end = min(len(t), win_start + 2500)
+        win = t[win_start:win_end]
+
+        local_candidates = []
+
+        # hyphenated X-for-Y
+        for mm in RATIO_FOR_PATTERN.finditer(win):
+            new = _to_int(mm.group("new"))
+            old = _to_int(mm.group("old"))
+            if not (0 < new < old):
+                continue
+
+            gs = win_start + mm.start()
+            ge = win_start + mm.end()
+
+            if looks_like_date_nearby(gs, ge):
+                continue
+            if is_range_context(gs, ge):
+                continue
+            if looks_like_style_junk(gs, ge):
+                continue
+
+            local_candidates.append((score_candidate(gs, ge, new, old), new, old))
+
+        # colon X:Y
+        for mm in RATIO_COLON_PATTERN.finditer(win):
+            new = _to_int(mm.group("new"))
+            old = _to_int(mm.group("old"))
+            if not (0 < new < old):
+                continue
+
+            gs = win_start + mm.start()
+            ge = win_start + mm.end()
+
+            if looks_like_date_nearby(gs, ge):
+                continue
+            if is_range_context(gs, ge):
+                continue
+            if looks_like_style_junk(gs, ge):
+                continue
+
+            local_candidates.append((score_candidate(gs, ge, new, old), new, old))
+
+        if local_candidates:
+            local_candidates.sort(key=lambda x: x[0])
+            cand = local_candidates[0]  # best in this window
+            if best_exec is None or cand[0] < best_exec[0]:
+                best_exec = cand
+
+    # If we found something in execution window(s), return the best
+    if best_exec is not None:
+        _, new, old = best_exec
+        return new, old
+
+    # -----------------------------
+    # 2) GLOBAL SCAN: add candidates (with junk/date/range filters)
+    # -----------------------------
     for m in RATIO_FOR_PATTERN.finditer(t):
         new = _to_int(m.group("new"))
         old = _to_int(m.group("old"))
+        if not (0 < new < old):
+            continue
 
         if looks_like_date_nearby(m.start(), m.end()):
             continue
-
-        # NEW: skip/penalize authorization ranges
         if is_range_context(m.start(), m.end()):
-            # Option A (best): SKIP range candidates entirely
+            continue
+        if looks_like_style_junk(m.start(), m.end()):
             continue
 
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window)) 
+        window = tl[max(0, m.start() - 220): min(len(tl), m.end() + 220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+
     # Colon X:Y
     for m in RATIO_COLON_PATTERN.finditer(t):
         new = _to_int(m.group("new"))
         old = _to_int(m.group("old"))
+        if not (0 < new < old):
+            continue
+
         if looks_like_date_nearby(m.start(), m.end()):
             continue
-
-        # NEW: skip/penalize authorization ranges
         if is_range_context(m.start(), m.end()):
-            # Option A (best): SKIP range candidates entirely
+            continue
+        if looks_like_style_junk(m.start(), m.end()):
             continue
 
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window)) 
-    # Prose: each/every ... (N) shares ... into (1) share
-        # Prose: each/every ... (N) shares ... into (M) shares
+        window = tl[max(0, m.start() - 220): min(len(tl), m.end() + 220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+
+    if "shareholders will receive" in tl:
+        i = tl.find("shareholders will receive")
+        print("[DEBUG] receive-snippet:", tl[i:i+250])
+        print("[DEBUG] prose matches:", len(list(PROSE_RECEIVE_WORDS_PATTERN.finditer(tl))))
+
+
+    # Prose: each/every ... (N) shares ... into (M) shares
     for m in PROSE_EVERY_PATTERN.finditer(t):
         old = _to_int(m.group("old_num"))
         new = _to_int(m.group("new_num"))
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        if not looks_like_date_nearby(m.start(), m.end()):
-            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+        if not (0 < new < old):
+            continue
 
-    # Prose alternate: (N) shares ... into (1) share
-        # Prose alternate: (N) shares ... into (M) shares
+        if looks_like_date_nearby(m.start(), m.end()):
+            continue
+        if looks_like_style_junk(m.start(), m.end()):
+            continue
+
+        window = tl[max(0, m.start() - 220): min(len(tl), m.end() + 220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+
+    # Prose alternate: (N) shares ... into (M) shares
     for m in PROSE_INTO_PATTERN.finditer(t):
         old = _to_int(m.group("old_num"))
         new = _to_int(m.group("new_num"))
-        window = tl[max(0, m.start()-220): min(len(tl), m.end()+220)]
-        if not looks_like_date_nearby(m.start(), m.end()):
-            candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
-        # NEW: OCG-style number-words ratio
-   
+        if not (0 < new < old):
+            continue
+
+        if looks_like_date_nearby(m.start(), m.end()):
+            continue
+        if looks_like_style_junk(m.start(), m.end()):
+            continue
+
+        window = tl[max(0, m.start() - 220): min(len(tl), m.end() + 220)]
+        candidates.append((score_candidate(m.start(), m.end(), new, old), new, old, m.group(0), window))
+
+    for m in PROSE_RECEIVE_WORDS_PATTERN.finditer(tl):
+        new_raw = m.group("new").strip()
+        old_raw = m.group("old").strip()
+
+        # parse new
+        new = int(new_raw) if new_raw.isdigit() else words_to_int(new_raw)
+        # parse old (likely words)
+        old = int(old_raw) if old_raw.strip().isdigit() else words_to_int(old_raw)
+
+        if new is None or old is None:
+            continue
+        if not (0 < new < old):
+            continue
+
+        start, end = m.start(), m.end()
+
+        window = tl[max(0, start-220): min(len(tl), end+220)]
+        candidates.append((score_candidate(start, end, new, old), new, old, m.group(0), window))
+
+    for m in PROSE_CONSOLIDATION_FOR_EVERY.finditer(tl):
+        new_raw = m.group("new").strip()
+        old_raw = m.group("old").strip()
+
+        new = int(new_raw) if new_raw.isdigit() else words_to_int(new_raw)
+        old = int(old_raw) if old_raw.isdigit() else words_to_int(old_raw)
+
+        if new is None or old is None:
+            continue
+        if not (0 < new < old):
+            continue
+
+        start, end = m.start(), m.end()
+        if looks_like_style_junk(start, end):
+            continue
+
+        window = tl[max(0, start-220): min(len(tl), end+220)]
+        candidates.append((score_candidate(start, end, new, old), new, old, m.group(0), window))
+
+    # Authorization-style range (fallback only)
     rm = RATIO_RANGE_PATTERN.search(t)
     if rm:
         a_new, a_old = _to_int(rm.group("a_new")), _to_int(rm.group("a_old"))
         b_new, b_old = _to_int(rm.group("b_new")), _to_int(rm.group("b_old"))
 
-        # normalize so "1-for-30" is the larger "old"
         lo = (a_new, a_old) if a_old <= b_old else (b_new, b_old)
         hi = (b_new, b_old) if a_old <= b_old else (a_new, a_old)
 
-        # If we got an effective date/trading language but no exact ratio, choose HI bound.
-        # (This matches your PAVM reality but still keeps logic explicit.)
         if "will become effective" in tl or "begin trading on a split-adjusted basis" in tl:
             return hi
 
@@ -362,7 +509,50 @@ def extract_ratio(text: str, debug_label: str = "") -> Tuple[Optional[int], Opti
     _, best_new, best_old, _, _ = candidates[0]
     return best_new, best_old
 
-import re
+# --- NEW: header event-date parser (Period of Report / earliest event date) ---
+# --- Event date extractor (Period of Report / earliest event reported) ---
+
+_HDR_SLICE_CHARS_EVENTDATE = 40000  # cover SEC-HEADER + front page
+
+_CONFORMED_PERIOD_RE = re.compile(
+    r"(?:CONFORMED\s+)?PERIOD\s+OF\s+REPORT:\s*(\d{8})",
+    re.IGNORECASE,
+)
+
+_DATE_OF_REPORT_RE = re.compile(
+    r"DATE\s+OF\s+REPORT\s*\(Date\s+of\s+earliest\s+event\s+reported\)\s*:\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+
+def extract_event_reported_datetime(
+    text: str,
+    tz: ZoneInfo = ZoneInfo("America/New_York"),
+) -> Optional[datetime]:
+    """
+    Returns tz-aware datetime at 00:00 local time for the event date:
+      1) (CONFORMED) PERIOD OF REPORT: YYYYMMDD   (most reliable)
+      2) DATE OF REPORT (Date of earliest event reported): Month DD, YYYY
+    """
+    if not text:
+        return None
+
+    head = text[:_HDR_SLICE_CHARS_EVENTDATE]
+
+    m = _CONFORMED_PERIOD_RE.search(head)
+    if m:
+        d = datetime.strptime(m.group(1), "%Y%m%d")
+        return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+
+    m = _DATE_OF_REPORT_RE.search(head)
+    if m:
+        try:
+            d = dtparser.parse(m.group(1), fuzzy=True)
+            return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
+        except Exception:
+            return None
+
+    return None
+
 
 _DELISTING_PATTERNS = [
     r"\bitem\s*3\.01\b",
@@ -609,152 +799,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 
-# def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
-#     """
-#     Extract the reverse-split MARKET effective / trading date.
-
-#     Key rules:
-#       - Bucket candidates into MARKET vs NON-MARKET; if any MARKET candidates exist, only pick among them.
-#       - Prefer dates on/after filing date (with a small negative buffer), but do NOT hard-require it
-#         because some 8-Ks are filed after the split is already effective.
-#       - If only non-market candidates exist and they look like approval/Delaware/charter dates,
-#         return None (avoid false positives).
-#     """
-#     if not text:
-#         return None
-
-#     t = _norm_text_html(text)
-
-#     # 0) explicit Effective Time definition (highest precision)
-#     m = EFFECTIVE_TIME_DEF_PATTERN.search(t)
-#     if m:
-#         try:
-#             return dtparser.parse(m.group("date"), fuzzy=True)
-#         except Exception:
-#             pass
-
-#     market_candidates: list[tuple[int, datetime, str]] = []
-#     other_candidates: list[tuple[int, datetime, str]] = []
-
-#     def _is_charter_ctx(cl: str) -> bool:
-#         return (
-#             "certificate of amendment" in cl
-#             or "secretary of state" in cl
-#             or "state of delaware" in cl
-#         )
-
-#     def _is_market_ctx(cl: str) -> bool:
-#         if _is_charter_ctx(cl):
-#             # only count as market if it explicitly references trading behavior
-#             return (
-#                 "reflected in the trading" in cl
-#                 or "split-adjusted" in cl
-#                 or "begin trading" in cl
-#                 or "commence trading" in cl
-#                 or "trade on a split-adjusted basis" in cl
-#                 or "market open" in cl
-#             )
-
-#         # non-charter windows can treat these as market signals
-#         return (
-#             "reflected in the trading" in cl
-#             or "split-adjusted" in cl
-#             or "begin trading" in cl
-#             or "commence trading" in cl
-#             or "trade on a split-adjusted basis" in cl
-#             or "market open" in cl
-#             or "effective time" in cl
-#             or "will become effective" in cl
-#             or "become effective" in cl
-#         )
-
-
-
-#     # 1) Trigger-based candidates
-#     trig_cands = _find_dates_near_triggers(t, filed_at=filed_at)
-
-#     for item in trig_cands:
-#         # Support both (score, dt, ctx) and (score, dt, ctx, kind)
-#         if len(item) == 4:
-#             score, dt, ctx, kind = item
-#         else:
-#             score, dt, ctx = item
-#             kind = "market" if _is_market_ctx(ctx.lower()) else "non_market"
-
-#         if kind == "market":
-#             market_candidates.append((score, dt, ctx))
-#         else:
-#             other_candidates.append((score, dt, ctx))
-
-#     # 2) Pattern-based candidates
-#     for pat in DATE_CANDIDATE_PATTERNS:
-#         for m in pat.finditer(t):
-#             raw = m.group("date")
-#             try:
-#                 dt = dtparser.parse(raw, fuzzy=True)
-#             except Exception:
-#                 continue
-
-#             start = max(0, m.start() - 260)
-#             end = min(len(t), m.end() + 260)
-#             ctx = t[start:end]
-#             score = _score_date_context(ctx)
-
-#             # filed_at sanity (light)
-#             if filed_at is not None:
-#                 days_diff = (dt.date() - filed_at.date()).days
-#                 if days_diff < -2:
-#                     score += 1200
-#                 elif days_diff < 0:
-#                     score += 500
-
-#             if _is_market_ctx(ctx.lower()):
-#                 market_candidates.append((score, dt, ctx))
-#             else:
-#                 other_candidates.append((score, dt, ctx))
-
-#     # Helper: choose best candidate but prefer on/after filing (with buffer)
-#     def _choose_best(cands: list[tuple[int, datetime, str]]) -> datetime:
-#         cands_sorted = sorted(cands, key=lambda x: (x[0], -x[1].timestamp()))
-
-#         if filed_at is None:
-#             return cands_sorted[0][1]
-
-#         # Prefer dates on/after (filed_at - buffer)
-#         # Buffer allows timezone quirks / "filed late, effective early next morning" cases.
-#         threshold = (filed_at - timedelta(days=1)).date()
-
-#         for score, dt, ctx in cands_sorted:
-#             if dt.date() >= threshold:
-#                 return dt
-
-#         # If none meet threshold, keep best overall (split may have already happened)
-#         return cands_sorted[0][1]
-
-#     # 3) Selection rule:
-#     # If we have any MARKET candidates, pick from those ONLY.
-#     if market_candidates:
-#         return _choose_best(market_candidates)
-
-#     # Otherwise fall back to NON-MARKET candidates with guardrails
-#     if not other_candidates:
-#         return None
-
-#     best_dt = _choose_best(other_candidates)
-
-#     # Guardrail: if best non-market looks like Delaware/approval and we saw no market language anywhere, return None
-#     # (Prevents PRPH-style Dec 2 false positives when Dec 22 isn't present in the extracted text)
-#     # Note: This is conservative; if you prefer always returning *some* date, remove this block.
-#     best_ctx = min(other_candidates, key=lambda x: (x[0], -x[1].timestamp()))[2]
-#     lower = best_ctx.lower()
-
-#     looks_non_market = any(rx.search(lower) for rx in NON_EFFECTIVE_NEGATIVES)
-#     saw_market_anywhere = any(trig.search(t.lower()) for trig, _ in EFFECTIVE_TRIGGERS)
-
-#     if looks_non_market and not saw_market_anywhere:
-#         return None
-
-#     return best_dt
 def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
     """
     Extract the reverse-split MARKET effective / trading date.
@@ -795,6 +839,8 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
                 "reflected in the trading" in cl
                 or "split-adjusted" in cl
                 or "begin trading" in cl
+                or "begin to trade" in cl          # NEW
+                or "begins to trade" in cl         # NEW
                 or "commence trading" in cl
                 or "trade on a split-adjusted basis" in cl
                 or "market open" in cl
@@ -804,22 +850,30 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
             "reflected in the trading" in cl
             or "split-adjusted" in cl
             or "begin trading" in cl
+            or "begin to trade" in cl              # NEW
+            or "begins to trade" in cl             # NEW
             or "commence trading" in cl
             or "trade on a split-adjusted basis" in cl
             or "market open" in cl
             or "effective time" in cl
             or "will become effective" in cl
             or "become effective" in cl
-            or "implemented effective" in cl  # NEW
-            or "market effective date" in cl   # NEW
+            or "implemented effective" in cl
+            or "market effective date" in cl
         )
+
 
     # --- NEW: direct “implemented effective <date>” candidates (treat as MARKET) ---
     IMPLEMENTED_EFFECTIVE_PATTERNS = [
         re.compile(r"\bimplemented\s+effective\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
         re.compile(r"\bimplemented\s+on\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE),
         re.compile(r"\bmarket\s+effective\s+date\b.*?(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b", re.IGNORECASE | re.DOTALL),
+
+        # NEW: market trading phrasing (covers your edge case)
+        re.compile(r"\bbegin(?:s)?\s+to\s+trade\b.*?\bon\s+(?P<date>[A-Za-z]+\s+\d{1,2},\s+\d{4})\b",
+                re.IGNORECASE | re.DOTALL),
     ]
+
     for pat in IMPLEMENTED_EFFECTIVE_PATTERNS:
         for m in pat.finditer(t):
             raw = m.group("date")
@@ -907,7 +961,6 @@ def extract_effective_date(text: str, filed_at: Optional[datetime] = None) -> Op
 
     return best_dt
 
-
 _DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
 _DASH_RE = re.compile(f"[{_DASHES}]")
 
@@ -935,7 +988,7 @@ def extract_reverse_split_context(text: str, window: int = 6500) -> str:
         "reverse stock split",
         "reverse split",
         # keep it, but penalize it (often points to the wrong “became effective” clause)
-         "share consolidation",
+        "share consolidation",
         "stock consolidation",
         "post-consolidation",
         "pre-consolidation",
@@ -1042,6 +1095,14 @@ def classify_rounding_policy(text: str) -> str:
     if ("pay in cash" in t or "cash" in t) and "rounded up" in t and " or " in t:
         return UNKNOWN
 
+        # ----------------------------
+    # 0) ROUND_DOWN (explicit reject case)
+    # ----------------------------
+    if "rounded down" in t and ("fractional" in t or "fraction" in t):
+        return ROUND_DOWN
+    if "round down" in t and ("fractional" in t or "fraction" in t):
+        return ROUND_DOWN
+
 
     # A) "rounded up" family (covers CODX: "rounded up to the next whole number")
     if "rounded up" in t and ("fractional" in t or "no fractional" in t):
@@ -1096,34 +1157,6 @@ def classify_rounding_policy(text: str) -> str:
 
     return UNKNOWN
 
-# def classify_rounding_policy(text: str) -> str:
-#     t = " ".join(text.lower().split())
-
-#     # Strong ROUND_UP (Beneficient-style)
-#     if (
-#         "additional share" in t
-#         and "fractional share" in t
-#         and "cash" not in t
-#     ):
-#         return ROUND_UP
-
-#     if "rounded up to the nearest whole share" in t:
-#         return ROUND_UP
-    
-#     if ("additional share" in t and "in lieu" in t and "fractional" in t) or \
-#     ("entitled to receive" in t and "additional" in t and "in lieu" in t and "fractional" in t):
-#         return ROUND_UP
-    
-#     if "one whole share" in t and "fraction" in t and "in lieu" in t:
-#         return ROUND_UP
-
-#     # Cash-in-lieu
-#     if "cash in lieu" in t or (
-#         "receive cash" in t and "fractional" in t
-#     ):
-#         return CASH_IN_LIEU
-
-#     return UNKNOWN
 
 from typing import Optional, Tuple
 
@@ -1295,67 +1328,6 @@ def extract_effective_date_market_priority(text: str, filed_at: Optional[datetim
 
     candidates.sort(key=_rank)
     return candidates[0][1]
-
-
-# def extract_effective_date_market_priority(text: str, filed_at: Optional[datetime] = None) -> Optional[datetime]:
-#     """
-#     Market-first effective date extractor.
-
-#     Updated behavior:
-#       - Finds candidate dates that appear after high-signal market/trading triggers.
-#       - If filed_at is provided: DISALLOW any effective date that precedes the filing date.
-#         If the top candidate is before filed_at, it is dropped and we choose the next best.
-#         If no valid candidates remain, returns None.
-#       - Otherwise: choose best by trigger priority, then latest date within that priority.
-
-#     Use in pipeline:
-#       effective = extract_effective_date_market_priority(full_text, filed_at)
-#       if effective is None:
-#           effective = extract_effective_date(full_text, filed_at)  # broader fallback
-#     """
-#     if not text:
-#         return None
-
-#     t = _norm_text_html(text)
-#     tl = t.lower()
-
-#     candidates: List[Tuple[int, datetime, str]] = []  # (priority, dt, trigger_name)
-
-#     for name, trig in _MARKET_TRIGGERS:
-#         pr = _MARKET_PRIORITY.get(name, 99)
-#         for m in trig.finditer(tl):
-#             start = m.start()
-#             window = t[start: min(len(t), start + 2500)]
-
-#             dm = _DATE_ANY.search(window)
-#             if not dm:
-#                 continue
-
-#             raw = dm.group("date")
-#             try:
-#                 dt = dtparser.parse(raw, fuzzy=True)
-#             except Exception:
-#                 continue
-
-#             candidates.append((pr, dt, name))
-
-#     if not candidates:
-#         return None
-
-#     # NEW: hard rule — do not allow an effective date earlier than the filing date
-#     if filed_at is not None:
-#         filing_date = filed_at.date()
-#         candidates = [c for c in candidates if c[1].date() >= filing_date]
-#         if not candidates:
-#             return None
-
-#     # Rank: priority asc, then latest date desc
-#     def _rank(item: Tuple[int, datetime, str]) -> Tuple[int, float]:
-#         pr, dt, _name = item
-#         return (pr, -dt.timestamp())
-
-#     candidates.sort(key=_rank)
-#     return candidates[0][1]
 
 
 # --- update extract_details to pass filed_at into extract_effective_date ---
