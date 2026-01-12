@@ -16,14 +16,16 @@ CACHE_FILINGS = DATA_DIR / "cache_filings.json"
 SEEN_ACCESSIONS = DATA_DIR / "seen_accessions.json"
 TICKER_MAP_PATH = DATA_DIR / "ticker_map.json"
 PRICE_CACHE_PATH = Path("price_cache.json")
+REJECTIONS_JSON = DATA_DIR / "rejections.json"
+REJECTIONS_CSV = DATA_DIR / "rejections.csv"
 
 WINDOW_HOURS = 72
 
 USER_AGENT = edgar.USER_AGENT
 
-FORCE_REPROCESS = 0
+FORCE_REPROCESS = 1
 
-LIMIT_PER_CIK = 5
+LIMIT_PER_CIK = 8
 
 def today_et():
     return datetime.now(ZoneInfo("America/New_York")).date()
@@ -87,6 +89,41 @@ class Runner:
         }
 
         results: List[dict] = []
+        rejections: List[dict] = []
+
+        def reject(filing, stage: str, reason: str, extra: dict | None = None):
+            acc_no_dashes = filing.accession.replace("-", "")
+            default_url = f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/{acc_no_dashes}/{filing.accession}-index.html"
+            filing_url = getattr(filing, "url", None) or getattr(filing, "link", None) or default_url
+
+            # IMPORTANT: keep a stable set of fields across ALL rejection records
+            rec = {
+                "accession": filing.accession,
+                "company": filing.company,
+                "cik": filing.cik,
+                "form": filing.form,
+                "filed_at": filing.filed_at.isoformat() if getattr(filing, "filed_at", None) else None,
+                "filing_url": filing_url,
+                "stage": stage,
+                "reason": reason,
+
+                # --- optional fields (always present; None when unknown) ---
+                "ticker": None,
+                "exchange": None,
+                "effective_date": None,
+                "ratio_display": None,
+                "ratio_new": None,
+                "ratio_old": None,
+                "rounding_policy": None,
+                "event_dt": None,
+                "event_age_hours": None,
+            }
+
+            if extra:
+                # extra may include any of the optional fields above; that’s fine now
+                rec.update(extra)
+
+            rejections.append(rec)
 
         for filing in filings:
             counts["total"] += 1
@@ -101,15 +138,12 @@ class Runner:
 
             if age_hours > WINDOW_HOURS:
                 counts["rejected_by_policy"] += 1
-                print(
-                        f"Skipping old filing: {filing.accession} "
-                        f"({age_hours:.1f}h old, filed_at={filing_time.isoformat()})"
-                    )
+                reject(filing, "age", f"Old filing: {age_hours:.1f}h > {WINDOW_HOURS}h", {"event_age_hours": round(age_hours, 2)})
                 continue
-
 
             if not FORCE_REPROCESS and filing.accession in self.seen:
                 counts["skipped_seen"] += 1
+                reject(filing, "seen", "Already processed (seen accession)")
                 continue
 
             text = edgar.fetch_filing_text(
@@ -117,6 +151,7 @@ class Runner:
             )
             if not text:
                 counts["no_text"] += 1
+                reject(filing, "no_text", "No filing text returned")
                 continue
 
             if parse.is_delisting_notice_only(text):
@@ -126,6 +161,7 @@ class Runner:
             has_reverse = parse.contains_reverse_split_language(text)
             if not has_reverse:
                 counts["no_reverse_lang"] += 1
+                reject(filing, "reverse_lang", "No reverse split language detected")
                 continue
 
             # 2) NEW: Require a fresh event date (Period of Report / earliest event reported)
@@ -135,16 +171,14 @@ class Runner:
                 # STRICT: if it fired "reverse split language" but we can't locate an event date,
                 # we do NOT allow it through (prevents stale/boilerplate false positives).
                 counts["rejected_by_policy"] += 1
-                print(f"Skipping reverse-lang filing with no event date parsed: {filing.accession}")
+                reject(filing, "event_dt", "Reverse language present but no event date parsed")
                 continue
 
             event_age_hours = (now_et - event_dt).total_seconds() / 3600
             if event_age_hours > WINDOW_HOURS:
                 counts["rejected_by_policy"] += 1
-                print(
-                    f"Skipping stale period-of-report: {filing.accession} "
-                    f"({event_age_hours:.1f}h old, event_dt={event_dt.isoformat()})"
-                )
+                reject(filing, "event_dt", f"Stale event_dt: {event_age_hours:.1f}h > {WINDOW_HOURS}h",
+                {"event_dt": event_dt.isoformat(), "event_age_hours": round(event_age_hours, 2)})
                 continue
 
             counts["reverse_lang"] += 1
@@ -189,20 +223,50 @@ class Runner:
             )
 
             today = datetime.now(ZoneInfo("America/New_York")).date()
+            # --- Effective date must exist ---
             if extraction.effective_date is None:
                 counts["rejected_by_policy"] += 1
-                print(f"Effective date not found")
+                reject(
+                    filing,
+                    stage="effective_date",
+                    reason="Effective date not found",
+                    extra={
+                        "rounding_policy": extraction.rounding_policy,
+                        "ratio_new": extraction.ratio_new,
+                        "ratio_old": extraction.ratio_old,
+                    },
+                )
                 continue
 
-            if extraction.effective_date is not None and extraction.effective_date.date() < today:
+            # --- Effective date must not be in the past ---
+            if extraction.effective_date.date() < today:
                 counts["rejected_by_policy"] += 1
-                print(f"Effective date already passed ({extraction.effective_date.date().isoformat()})")
+                reject(
+                    filing,
+                    stage="effective_date",
+                    reason=f"Effective date already passed ({extraction.effective_date.date().isoformat()})",
+                    extra={
+                        "effective_date": extraction.effective_date.isoformat(),
+                        "rounding_policy": extraction.rounding_policy,
+                        "ratio_new": extraction.ratio_new,
+                        "ratio_old": extraction.ratio_old,
+                    },
+                )
                 continue
 
-            # Reject explicit ROUND_DOWN policies
+            # --- Reject explicit ROUND_DOWN policies ---
             if extraction.rounding_policy == parse.ROUND_DOWN:
                 counts["rejected_by_policy"] += 1
-                print(f"Skipping: explicit ROUND_DOWN rounding policy ({filing.accession})")
+                reject(
+                    filing,
+                    stage="rounding_policy",
+                    reason="Explicit ROUND_DOWN rounding policy",
+                    extra={
+                        "effective_date": extraction.effective_date.isoformat(),
+                        "ratio_new": extraction.ratio_new,
+                        "ratio_old": extraction.ratio_old,
+                    },
+                )
                 continue
 
 
@@ -237,7 +301,14 @@ class Runner:
                 counts["accepted"] += 1
             else:
                 counts["rejected_by_policy"] += 1
-                print(record["rejection_reason"])
+                reject(filing, "filters", rejection, {
+                    "ticker": ticker,
+                    "exchange": exchange,
+                    "effective_date": record["effective_date"],
+                    "ratio_display": record["ratio_display"],
+                    "rounding_policy": record["rounding_policy"],
+                    "event_dt": record["event_dt"],
+                })
 
         self.filing_cache.save()
         self.seen.save()
@@ -280,6 +351,11 @@ class Runner:
 
         alert.write_json(RESULTS_JSON, results)
         alert.write_csv(RESULTS_CSV, results)
+
+        alert.write_json(REJECTIONS_JSON, rejections)
+        alert.write_csv(REJECTIONS_CSV, rejections)
+        print(f"Wrote {len(rejections)} rejections to {REJECTIONS_JSON} and {REJECTIONS_CSV}")
+
 
         print("Filter stats:", counts)
         return results
