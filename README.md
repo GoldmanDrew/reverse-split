@@ -55,7 +55,7 @@ reverse-split/
 - `SEC_USER_AGENT` – required by the SEC for scripted access (e.g., `Your Name contact@example.com`).
 - `ALERT_SENDER_EMAIL`, `ALERT_SENDER_APP_PWD`, `ALERT_RECIPIENTS` for Gmail-based email delivery.
 
-The workflow installs dependencies, executes `python run.py`, and uploads `data/results.json` as an artifact.
+The workflow installs dependencies, executes `python run.py`, and uploads `data/results.json` plus `data/rejections.json` as artifacts.
 
 ## Why this approach
 
