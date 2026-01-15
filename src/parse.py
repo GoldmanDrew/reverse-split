@@ -1356,6 +1356,13 @@ def extract_details(text: str, filed_at: datetime) -> Extraction:
             rounding = classify_rounding_policy(text)  # fallback to full doc
 
     ratio_new, ratio_old = extract_ratio(ctx)
+    # Context slicing can miss the definitive ratio in very large filings.
+    # If we failed to parse a ratio from ctx, retry on the full document.
+    if ratio_new is None or ratio_old is None:
+        r2_new, r2_old = extract_ratio(text)
+        if r2_new is not None and r2_old is not None:
+            ratio_new, ratio_old = r2_new, r2_old
+
     # PRPH-first: try market-signal extraction on full text
     effective = extract_effective_date_market_priority(text, filed_at=filed_at)
     if effective is None:
